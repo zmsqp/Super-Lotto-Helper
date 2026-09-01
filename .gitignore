@@ -1,0 +1,10 @@
+data/
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+build/
+dist/
+*.spec
+*.dltbak.json
