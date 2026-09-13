@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from services.algorithms import compare_tickets
+from services.algorithms import comparison_summary
 from services.stats import format_nums
 
 
@@ -114,6 +114,24 @@ class LogTab(QWidget):
             keyword=self.keyword_edit.text(),
             only_drawn=self.only_drawn.isChecked(),
         )
+        for session in self._rows:
+            draw = self.store.get_draw(session["target_period"])
+            if not draw:
+                continue
+            comparison = comparison_summary(session.get("tickets") or [], draw, session.get("pool") or {})
+            session["comparison"] = comparison
+            needs_update = (
+                session.get("hit_front") != comparison["best_front"]
+                or session.get("hit_back") != comparison["best_back"]
+                or any("grade" not in ticket for ticket in session.get("tickets") or [])
+            )
+            if needs_update:
+                self.store.update_session_hits(
+                    session["id"], comparison["best_front"], comparison["best_back"], comparison["tickets"]
+                )
+                session["tickets"] = comparison["tickets"]
+                session["hit_front"] = comparison["best_front"]
+                session["hit_back"] = comparison["best_back"]
         self.table.setRowCount(len(self._rows))
         for i, s in enumerate(self._rows):
             summary = ""
@@ -125,7 +143,12 @@ class LogTab(QWidget):
                     summary += f" 等{len(tickets)}注"
             hit = "—"
             if s.get("hit_front") is not None:
-                hit = f"前{s['hit_front']} 后{s['hit_back']}"
+                comp = s.get("comparison") or {}
+                grade = f" {comp['best_grade']}等奖" if comp.get("best_grade") else " 未中奖"
+                hit = (
+                    f"最佳前{s['hit_front']}后{s['hit_back']}{grade}｜"
+                    f"池前{comp.get('front_pool_hits', 0)}后{comp.get('back_pool_hits', 0)}"
+                )
             vals = [str(s["id"]), s["target_period"], s["saved_at"], summary, s.get("note") or "", hit]
             for c, v in enumerate(vals):
                 item = QTableWidgetItem(v)
@@ -190,13 +213,30 @@ class LogTab(QWidget):
         for t in s.get("tickets") or []:
             extra = ""
             if t.get("hit_front") is not None:
-                extra = f"  → 命中前{t['hit_front']}后{t['hit_back']}"
+                grade = f"，{t['grade']}等奖" if t.get("grade") else "，未中奖"
+                extra = f"  → 命中前{t['hit_front']}后{t['hit_back']}{grade}"
             lines.append(
                 f"{t.get('name', '')}  {format_nums(t.get('front') or [])}  +  "
                 f"{format_nums(t.get('back') or [])}{extra}"
             )
         if s.get("hit_front") is not None:
-            lines.append(f"\n主推对照：前区 {s['hit_front']}　后区 {s['hit_back']}　于 {s.get('compared_at')}")
+            comp = s.get("comparison") or {}
+            best_grade = f"{comp['best_grade']}等奖" if comp.get("best_grade") else "未中奖"
+            lines.append(
+                f"\n五注最佳同注：前区{s['hit_front']}　后区{s['hit_back']}　{best_grade}"
+            )
+            lines.append(
+                f"候选池覆盖：前区{comp.get('front_pool_hits', 0)}/{comp.get('front_pool_size', 0)}　"
+                f"后区{comp.get('back_pool_hits', 0)}/{comp.get('back_pool_size', 0)}"
+            )
+            lines.append("公平单注命中均值：前区0.714　后区0.333；池覆盖不等于单注命中。")
+        model = (s.get("pool") or {}).get("model") or {}
+        front_ref = model.get("front_reference") or {}
+        if front_ref:
+            lines.append(
+                f"保存时样本外参考：前区{front_ref.get('pool_size')}号池覆盖2+ "
+                f"{front_ref.get('coverage_rate', 0):.1%}，公平基准{front_ref.get('fair_rate', 0):.1%}。"
+            )
         draw = self.store.get_draw(s["target_period"])
         if draw:
             lines.append(
@@ -215,8 +255,9 @@ class LogTab(QWidget):
         if not draw:
             QMessageBox.information(self, "尚未开奖", f"期号 {s['target_period']} 还没有开奖记录。")
             return
-        tickets, hf, hb = compare_tickets(s.get("tickets") or [], draw)
-        self.store.update_session_hits(s["id"], hf, hb, tickets)
+        comparison = comparison_summary(s.get("tickets") or [], draw, s.get("pool") or {})
+        tickets = comparison["tickets"]
+        self.store.update_session_hits(s["id"], comparison["best_front"], comparison["best_back"], tickets)
         self.reload()
         # 重新选中同一条
         for i, row in enumerate(self._rows):
@@ -225,10 +266,16 @@ class LogTab(QWidget):
                 break
         lines = [f"{s['target_period']} 开奖 {format_nums(draw['front'])} + {format_nums(draw['back'])}", ""]
         for t in tickets:
+            ticket_grade = f"{t['grade']}等奖" if t.get("grade") else "未中奖"
             lines.append(
                 f"{t.get('name', '')}  {format_nums(t.get('front') or [])} + {format_nums(t.get('back') or [])}"
-                f"  → 前区{t['hit_front']} 后区{t['hit_back']}"
+                f"  → 前区{t['hit_front']} 后区{t['hit_back']} {ticket_grade}"
             )
+        grade = f"{comparison['best_grade']}等奖" if comparison.get("best_grade") else "未中奖"
+        lines.append(
+            f"\n五注最佳同注：前{comparison['best_front']}后{comparison['best_back']}，{grade}；"
+            f"候选池覆盖前{comparison['front_pool_hits']}后{comparison['back_pool_hits']}。"
+        )
         QMessageBox.information(self, "对照结果", "\n".join(lines))
 
     def _load_to_predict(self) -> None:

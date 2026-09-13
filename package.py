@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-import shutil
+import sqlite3
 from pathlib import Path
 
 import PyInstaller.__main__
@@ -12,8 +12,15 @@ ROOT = Path(__file__).resolve().parent
 SEED_CSV = ROOT / "assets" / "dlt_history.csv"
 if not SEED_CSV.exists():
     SEED_CSV = ROOT.parent / "1" / "dlt_history.csv"
-DIST = ROOT / "dist"
-EXE_NAME = "大乐透统计与记录"
+DIST = ROOT / "dist_v2_1"
+EXE_NAME = "大乐透统计与记录_v2.1"
+
+
+def copy_database(source: Path, target: Path) -> None:
+    """使用 SQLite 在线备份，源程序运行时也能得到一致的数据库副本。"""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(str(source)) as src, sqlite3.connect(str(target)) as dst:
+        src.backup(dst)
 
 
 def main() -> None:
@@ -40,18 +47,16 @@ def main() -> None:
             str(ROOT / "build"),
         ]
     )
-    # 把现有本地库拷到 EXE 旁边，避免打包后看起来像“日志丢了”
-    src_db_dir = ROOT / "data"
+    # 独立版本目录不覆盖旧程序，首次打包时继承上一版用户数据库和推测日志。
     dst_db_dir = DIST / "data"
-    if src_db_dir.exists():
-        dst_db_dir.mkdir(parents=True, exist_ok=True)
-        for item in src_db_dir.iterdir():
-            target = dst_db_dir / item.name
-            if item.is_file():
-                shutil.copy2(item, target)
+    target = dst_db_dir / "dlt.db"
+    sources = [ROOT / "dist_v2" / "data" / "dlt.db", ROOT / "data" / "dlt.db"]
+    source = next((item for item in sources if item.exists()), None)
+    if source is not None and not target.exists():
+        copy_database(source, target)
     exe = DIST / f"{EXE_NAME}.exe"
     print(f"已生成：{exe}")
-    print(f"数据目录：{dst_db_dir}（请与 EXE 放在同一文件夹）")
+    print(f"数据目录：{dst_db_dir}（已存在的数据库不会被打包覆盖）")
 
 
 if __name__ == "__main__":

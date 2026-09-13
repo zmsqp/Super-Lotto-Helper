@@ -6,5 +6,6 @@ __pycache__/
 venv/
 build/
 dist/
+dist_v*/
 *.spec
 *.dltbak.json

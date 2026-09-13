@@ -13,6 +13,41 @@ P_FRONT = FRONT_K / FRONT_N
 P_BACK = BACK_K / BACK_N
 
 
+def prize_grade(front_hits: int, back_hits: int) -> int | None:
+    """大乐透现行九级奖判定；无奖返回 None。"""
+    if front_hits == 5 and back_hits == 2:
+        return 1
+    if front_hits == 5 and back_hits == 1:
+        return 2
+    if front_hits == 5 and back_hits == 0:
+        return 3
+    if front_hits == 4 and back_hits == 2:
+        return 4
+    if front_hits == 4 and back_hits == 1:
+        return 5
+    if front_hits == 3 and back_hits == 2:
+        return 6
+    if front_hits == 4 and back_hits == 0:
+        return 7
+    if (front_hits == 3 and back_hits == 1) or (front_hits == 2 and back_hits == 2):
+        return 8
+    if (front_hits == 3 and back_hits == 0) or (front_hits == 2 and back_hits == 1) or back_hits == 2:
+        return 9
+    return None
+
+
+def fair_pool_coverage(pool_size: int, nmax: int, pick_count: int, at_least: int) -> float:
+    """固定号码池在公平抽取下覆盖至少 at_least 个开奖号码的精确概率。"""
+    if not 0 <= pool_size <= nmax or not 0 <= at_least <= pick_count:
+        return 0.0
+    total = math.comb(nmax, pick_count)
+    favorable = 0
+    for hit_count in range(at_least, pick_count + 1):
+        if hit_count <= pool_size and pick_count - hit_count <= nmax - pool_size:
+            favorable += math.comb(pool_size, hit_count) * math.comb(nmax - pool_size, pick_count - hit_count)
+    return favorable / total
+
+
 def slice_draws(draws: list[dict], window: int) -> list[dict]:
     """按窗口截取最近若干期；window<=0 表示全量。"""
     if window and window > 0 and len(draws) > window:

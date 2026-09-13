@@ -30,6 +30,7 @@ WINDOW_OPTIONS = [
     ("全量", 0),
 ]
 MODE_OPTIONS = [
+    ("多窗口集成（推荐）", "ensemble"),
     ("综合 blend", "blend"),
     ("热号", "hot"),
     ("冷号", "cold"),
@@ -159,7 +160,7 @@ class PredictTab(QWidget):
         self.gen_btn.setMinimumHeight(36)
         self.gen_btn.clicked.connect(self._generate)
         al.addWidget(self.gen_btn)
-        hint = QLabel("历史拟合不能改变一等奖理论概率。排除号不进推荐，关注号加权靠前。")
+        hint = QLabel("集成模式会显示500期逐期事前参考。排除号不进推荐；关注号只是温和偏好，不等于概率提升。")
         hint.setObjectName("subtitleLabel")
         hint.setWordWrap(True)
         al.addWidget(hint)
@@ -283,6 +284,28 @@ class PredictTab(QWidget):
         lines.append(f"232 复式池：{format_nums(result['duplex_232'])}")
         lines.append(f"前区关注池：{format_nums(result['front_pool'])}")
         lines.append(f"后区关注池：{format_nums(result['back_pool'])}")
+        model = result.get("model") or {}
+        front_ref = model.get("front_reference") or {}
+        back_ref = model.get("back_reference") or {}
+        if front_ref:
+            front_status = "超过" if front_ref.get("beats_fair") else "未超过"
+            lines.append(
+                f"前区{front_ref.get('pool_size')}号池样本外覆盖2+："
+                f"{front_ref.get('coverage_rate', 0):.1%}（公平基准 {front_ref.get('fair_rate', 0):.1%}，{front_status}）"
+            )
+        if back_ref:
+            back_status = "超过" if back_ref.get("beats_fair") else "未超过"
+            lines.append(
+                f"后区{back_ref.get('pool_size')}号池样本外覆盖2枚："
+                f"{back_ref.get('coverage_rate', 0):.1%}（公平基准 {back_ref.get('fair_rate', 0):.1%}，{back_status}）"
+            )
+        params = result.get("params") or {}
+        lines.append(
+            f"模型 {params.get('model_version', 'legacy')}　"
+            f"数据截止 {params.get('data_cutoff_period', '—')}（{params.get('data_cutoff_date', '—')}）"
+        )
+        if params.get("constraints_relaxed"):
+            lines.append(f"组合不足，已自动放宽：{'、'.join(params['constraints_relaxed'])}")
         excl_f = marks["front"]["exclude"]
         excl_b = marks["back"]["exclude"]
         if excl_f:
@@ -295,7 +318,8 @@ class PredictTab(QWidget):
                 f"{t['name']}  {format_nums(t['front'])}  +  {format_nums(t['back'])}"
                 f"    形态{t['shape']}  前区{t['odd_even']}  后区{t['back_oe']}"
                 f"    前区和{t.get('front_sum', sum(t['front']))}（{t.get('sum_flag', '')}）"
-                f"  后区和{t.get('back_sum', sum(t['back']))}"
+                f"  后区和{t.get('back_sum', sum(t['back']))}  {t.get('role', '')}"
+                f"  分层{''.join(str(x) for x in t.get('tier_pattern', []))}"
             )
         self.result_edit.setPlainText("\n".join(lines))
 
@@ -319,6 +343,7 @@ class PredictTab(QWidget):
                 "duplex_232": self.last_result.get("duplex_232") or [],
                 "front_dans": self.last_result.get("front_dans") or {},
                 "back_dans": self.last_result.get("back_dans") or {},
+                "model": self.last_result.get("model") or {},
             },
             self.note_edit.text().strip(),
         )
@@ -349,6 +374,7 @@ class PredictTab(QWidget):
             "duplex_232": pool.get("duplex_232") or [],
             "front_dans": pool.get("front_dans") or {},
             "back_dans": pool.get("back_dans") or {},
+            "model": pool.get("model") or {},
             "pool_note": "日志载入",
         }
         lines = [f"已载入期号 {period} 的历史推测"]
