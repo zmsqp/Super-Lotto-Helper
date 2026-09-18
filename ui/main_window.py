@@ -55,7 +55,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.store = Store()
         self._worker: RefreshWorker | None = None
-        self.setWindowTitle("大乐透统计与记录 v2")
+        self.setWindowTitle("大乐透统计与记录 v2.2")
         self.resize(1280, 840)
         self.setStyleSheet(APP_STYLESHEET)
         self._build_menu()
@@ -69,9 +69,9 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(14, 12, 14, 8)
         root.setSpacing(8)
 
-        title = QLabel("大乐透统计与记录 v2")
+        title = QLabel("大乐透统计与记录 v2.2")
         title.setObjectName("titleLabel")
-        subtitle = QLabel("开奖增量、逐期事前参考、覆盖组合优化与推测版本留档。历史拟合不能改变一等奖理论概率。")
+        subtitle = QLabel("开奖覆盖与官方销量人气分层并行。人气模型只降低潜在分奖风险，不改变开奖概率。")
         subtitle.setObjectName("subtitleLabel")
         root.addWidget(title)
         root.addWidget(subtitle)
@@ -116,6 +116,7 @@ class MainWindow(QMainWindow):
 
     def _bootstrap(self) -> None:
         info = self.store.ensure_seed()
+        self.store.ensure_market_seed()
         self.stats_tab.reload()
         self.predict_tab.reload()
         self.log_tab.reload()

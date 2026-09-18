@@ -14,25 +14,21 @@ P_BACK = BACK_K / BACK_N
 
 
 def prize_grade(front_hits: int, back_hits: int) -> int | None:
-    """大乐透现行九级奖判定；无奖返回 None。"""
+    """大乐透现行七级奖判定；无奖返回 None。"""
     if front_hits == 5 and back_hits == 2:
         return 1
     if front_hits == 5 and back_hits == 1:
         return 2
-    if front_hits == 5 and back_hits == 0:
+    if (front_hits == 5 and back_hits == 0) or (front_hits == 4 and back_hits == 2):
         return 3
-    if front_hits == 4 and back_hits == 2:
-        return 4
     if front_hits == 4 and back_hits == 1:
+        return 4
+    if (front_hits == 4 and back_hits == 0) or (front_hits == 3 and back_hits == 2):
         return 5
-    if front_hits == 3 and back_hits == 2:
-        return 6
-    if front_hits == 4 and back_hits == 0:
-        return 7
     if (front_hits == 3 and back_hits == 1) or (front_hits == 2 and back_hits == 2):
-        return 8
+        return 6
     if (front_hits == 3 and back_hits == 0) or (front_hits == 2 and back_hits == 1) or back_hits == 2:
-        return 9
+        return 7
     return None
 
 

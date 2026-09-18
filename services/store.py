@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-BACKUP_VERSION = 1
+BACKUP_VERSION = 2
 
 
 def is_frozen() -> bool:
@@ -47,6 +47,13 @@ def seed_csv_path() -> Path:
     if bundled.exists():
         return bundled
     return Path(__file__).resolve().parent.parent.parent / "1" / "dlt_history.csv"
+
+
+def market_seed_path() -> Path:
+    bundled = resource_dir() / "assets" / "dlt_market_history.json"
+    if bundled.exists():
+        return bundled
+    return Path(__file__).resolve().parent.parent / "assets" / "dlt_market_history.json"
 
 
 def _now() -> str:
@@ -99,6 +106,15 @@ class Store:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS draw_market (
+                period TEXT PRIMARY KEY,
+                sales INTEGER NOT NULL DEFAULT 0,
+                pool_balance REAL NOT NULL DEFAULT 0,
+                prize_counts_json TEXT NOT NULL DEFAULT '{}',
+                prize_amounts_json TEXT NOT NULL DEFAULT '{}',
+                fetched_at TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(period) REFERENCES draws(period)
+            );
             CREATE INDEX IF NOT EXISTS idx_sessions_period ON sessions(target_period);
             CREATE INDEX IF NOT EXISTS idx_sessions_saved ON sessions(saved_at);
             """
@@ -150,24 +166,105 @@ class Store:
         new_ones = []
         for d in draws:
             period = str(d["period"]).strip()
-            if period in existing:
-                continue
-            self.conn.execute(
-                "INSERT INTO draws(period, draw_date, front, back) VALUES(?,?,?,?)",
-                (
-                    period,
-                    d["date"],
-                    json.dumps(list(d["front"]), ensure_ascii=False),
-                    json.dumps(list(d["back"]), ensure_ascii=False),
-                ),
-            )
-            existing.add(period)
-            new_ones.append(
-                {"period": period, "date": d["date"], "front": list(d["front"]), "back": list(d["back"])}
-            )
+            if period not in existing:
+                self.conn.execute(
+                    "INSERT INTO draws(period, draw_date, front, back) VALUES(?,?,?,?)",
+                    (
+                        period,
+                        d["date"],
+                        json.dumps(list(d["front"]), ensure_ascii=False),
+                        json.dumps(list(d["back"]), ensure_ascii=False),
+                    ),
+                )
+                existing.add(period)
+                new_ones.append(
+                    {
+                        "period": period,
+                        "date": d["date"],
+                        "front": list(d["front"]),
+                        "back": list(d["back"]),
+                    }
+                )
+            if d.get("sales") or d.get("prize_counts"):
+                self._upsert_market_row(d)
         self.conn.commit()
         new_ones.sort(key=lambda r: r["period"])
         return new_ones
+
+    def _upsert_market_row(self, row: dict) -> None:
+        period = str(row.get("period") or "").strip()
+        if not period:
+            return
+        self.conn.execute(
+            """
+            INSERT INTO draw_market(
+                period, sales, pool_balance, prize_counts_json, prize_amounts_json, fetched_at
+            ) VALUES(?,?,?,?,?,?)
+            ON CONFLICT(period) DO UPDATE SET
+                sales=excluded.sales,
+                pool_balance=excluded.pool_balance,
+                prize_counts_json=excluded.prize_counts_json,
+                prize_amounts_json=excluded.prize_amounts_json,
+                fetched_at=excluded.fetched_at
+            """,
+            (
+                period,
+                int(row.get("sales") or 0),
+                float(row.get("pool_balance") or 0),
+                json.dumps(row.get("prize_counts") or {}, ensure_ascii=False),
+                json.dumps(row.get("prize_amounts") or {}, ensure_ascii=False),
+                _now(),
+            ),
+        )
+
+    def upsert_market_rows(self, rows: list[dict]) -> int:
+        existing_periods = {
+            row["period"] for row in self.conn.execute("SELECT period FROM draws")
+        }
+        saved = 0
+        for row in rows:
+            if str(row.get("period") or "") not in existing_periods:
+                continue
+            self._upsert_market_row(row)
+            saved += 1
+        self.conn.commit()
+        return saved
+
+    def list_market_asc(self) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT m.*, d.draw_date, d.front, d.back
+            FROM draw_market m JOIN draws d ON d.period=m.period
+            ORDER BY m.period ASC
+            """
+        ).fetchall()
+        return [
+            {
+                "period": row["period"],
+                "date": row["draw_date"],
+                "front": json.loads(row["front"]),
+                "back": json.loads(row["back"]),
+                "sales": int(row["sales"]),
+                "pool_balance": float(row["pool_balance"]),
+                "prize_counts": json.loads(row["prize_counts_json"] or "{}"),
+                "prize_amounts": json.loads(row["prize_amounts_json"] or "{}"),
+            }
+            for row in rows
+        ]
+
+    def import_market_seed(self, path: Optional[Path] = None) -> int:
+        source = Path(path) if path else market_seed_path()
+        if not source.exists():
+            return 0
+        payload = json.loads(source.read_text(encoding="utf-8-sig"))
+        rows = payload.get("rows") if isinstance(payload, dict) else payload
+        return self.upsert_market_rows(rows or [])
+
+    def ensure_market_seed(self) -> dict:
+        existing = int(self.conn.execute("SELECT COUNT(*) FROM draw_market").fetchone()[0])
+        imported = self.import_market_seed()
+        total = int(self.conn.execute("SELECT COUNT(*) FROM draw_market").fetchone()[0])
+        return {"imported": max(total - existing, 0), "total": total}
 
     def import_csv(self, path: Optional[Path] = None) -> int:
         """导入种子 CSV，返回新插入期数。"""
@@ -346,6 +443,7 @@ class Store:
             "version": BACKUP_VERSION,
             "exported_at": _now(),
             "draws": self.list_draws_asc(),
+            "market": self.list_market_asc(),
             "marks": self.dump_marks_rows(),
             "sessions": self.list_all_sessions(),
             "meta": self.dump_meta(),
@@ -356,6 +454,7 @@ class Store:
         return {
             "path": str(out),
             "draws": len(payload["draws"]),
+            "market": len(payload["market"]),
             "marks": len(payload["marks"]),
             "sessions": len(payload["sessions"]),
         }
@@ -370,6 +469,7 @@ class Store:
             raise ValueError("这不是本程序的备份文件")
         draws = payload.get("draws") or []
         new_draws = self.upsert_draws(draws)
+        market_saved = self.upsert_market_rows(payload.get("market") or [])
         new_marks = 0
         for row in payload.get("marks") or []:
             try:
@@ -403,6 +503,7 @@ class Store:
             "marks": new_marks,
             "sessions_new": new_sessions,
             "draws_total": self.count_draws(),
+            "market": market_saved,
             "sessions_total": len(self.list_all_sessions()),
         }
 

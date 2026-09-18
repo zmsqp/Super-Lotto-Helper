@@ -5,7 +5,9 @@ from __future__ import annotations
 import math
 from collections import Counter
 from itertools import combinations
+from typing import Callable
 
+from services.market import fit_crowd_model, load_market_validation
 from services.stats import (
     BACK_K,
     BACK_N,
@@ -37,7 +39,7 @@ SINGLE_SHAPES = {
 # 232 复式池：一区 2 + 二区 3 + 三区 2
 DUPLEX_232 = (2, 3, 2)
 FOCUS_BOOST = 0.25
-MODEL_VERSION = "ensemble-coverage-v2.1"
+MODEL_VERSION = "ensemble-coverage-v2.2"
 _REFERENCE_CACHE: dict[tuple, dict] = {}
 
 
@@ -315,6 +317,8 @@ def _pick_backs(
     odd_n: int,
     count: int,
     pair_residuals: dict[tuple[int, int], float] | None = None,
+    popularity_scorer: Callable[[list[int]], float] | None = None,
+    popularity_weight: float = 0.0,
 ) -> list[list[int]]:
     """后区 2 码组合优化：模型分、轻量关系分和五注号码覆盖分开考虑。"""
     eligible = [i for i in eligible_nums(BACK_N, exclude) if back_scores[i] != float("-inf")]
@@ -333,10 +337,33 @@ def _pick_backs(
         fc = len(set(back) & foc)
         s = back_scores[back[0]] + back_scores[back[1]]
         relation = (pair_residuals or {}).get(tuple(back), 0.0)
-        scored.append((s + 0.12 * relation + 0.20 * fc, s, back))
+        popularity = popularity_scorer(back) if popularity_scorer else 0.0
+        scored.append((s + 0.12 * relation + 0.20 * fc, s, back, popularity))
     if not scored and odd_n >= 0:
-        return _pick_backs(back_scores, exclude, focus, -1, count, pair_residuals)
-    scored.sort(key=lambda x: (x[0], x[1], tuple(-n for n in x[2])), reverse=True)
+        return _pick_backs(
+            back_scores,
+            exclude,
+            focus,
+            -1,
+            count,
+            pair_residuals,
+            popularity_scorer,
+            popularity_weight,
+        )
+    crowd_order = {
+        tuple(row[2]): rank / max(len(scored) - 1, 1)
+        for rank, row in enumerate(sorted(scored, key=lambda item: item[3]))
+    }
+    scored = [
+        (
+            row[0] - 0.8 * popularity_weight * crowd_order[tuple(row[2])],
+            row[1],
+            row[2],
+            row[3],
+        )
+        for row in scored
+    ]
+    scored.sort(key=lambda x: (x[0], x[1], -x[3], tuple(-n for n in x[2])), reverse=True)
     out = []
     used: Counter = Counter()
     while scored and len(out) < count:
@@ -362,6 +389,8 @@ def _select_diverse_fronts(
     preferred_shape: tuple[int, int, int] | None = None,
     preferred_odd: int = -1,
     tier_scores: list[float] | None = None,
+    popularity_scorer: Callable[[list[int]], float] | None = None,
+    popularity_weight: float = 0.0,
 ) -> list[tuple[list[int], str, float, float]]:
     """优先覆盖尚未覆盖的三元组，避免推荐列表只是同一注换一个号码。"""
     unique = []
@@ -377,6 +406,18 @@ def _select_diverse_fronts(
     high = set(ranked_numbers[:10])
     low = set(ranked_numbers[10:25])
     extreme_cold = set(ranked_numbers[-10:])
+    popularity_by_front = {
+        tuple(front): (
+            popularity_scorer(front) if popularity_scorer else _popularity_proxy(front)
+        )
+        for front in unique
+    }
+    popularity_rank = {
+        key: rank / max(len(unique) - 1, 1)
+        for rank, (key, _value) in enumerate(
+            sorted(popularity_by_front.items(), key=lambda item: item[1])
+        )
+    }
     selected: list[list[int]] = []
     covered_triples: set[tuple[int, int, int]] = set()
     usage: Counter = Counter()
@@ -400,9 +441,12 @@ def _select_diverse_fronts(
                 len(set(front) & low),
                 cold_count,
             )
-            popularity = _popularity_proxy(front)
+            popularity = popularity_by_front[tuple(front)]
+            crowd_penalty = popularity_rank[tuple(front)]
             utility = model_score + 0.10 * new_triples - 0.28 * overlap
             utility += 0.16 * sum(usage[number] == 0 for number in front)
+            # 人气层只在开奖评分接近时轻量择优，不把低人气解释成更易开奖。
+            utility -= popularity_weight * crowd_penalty
             if preferred_shape is not None and zone3(front) == preferred_shape:
                 utility += 0.24
             if preferred_odd < 0 or odd_even(front)[0] == preferred_odd:
@@ -411,7 +455,7 @@ def _select_diverse_fronts(
                 # 重点检验 3高+1低+1极冷；这是实验结构，不是假定有效的规律。
                 distance = sum(abs(actual - expected) for actual, expected in zip(tier_pattern, (3, 1, 1)))
                 structure_bonus = 0.55 if tier_pattern == (3, 1, 1) else -0.08 * distance
-                utility += structure_bonus + 0.20 * min(cold_count, 2) - 0.08 * popularity
+                utility += structure_bonus + 0.20 * min(cold_count, 2) - 0.08 * crowd_penalty
             key = (utility, model_score, -popularity, tuple(-number for number in front))
             if best is None or key > best[0]:
                 best = (key, front, model_score, popularity)
@@ -421,7 +465,10 @@ def _select_diverse_fronts(
             if not remaining:
                 break
             front = remaining[0]
-            best = ((0.0,), front, sum(scores[number] for number in front), _popularity_proxy(front))
+            popularity = popularity_by_front.get(
+                tuple(front), popularity_scorer(front) if popularity_scorer else _popularity_proxy(front)
+            )
+            best = ((0.0,), front, sum(scores[number] for number in front), popularity)
         _, front, model_score, popularity = best
         selected.append(front)
         covered_triples.update(combinations(front, 3))
@@ -454,6 +501,9 @@ def generate_recommendations(
     back_odd: int = 1,
     ticket_count: int = 5,
     constrain_sum: bool = True,
+    market_rows: list[dict] | None = None,
+    crowd_weight: float = 0.20,
+    include_reference: bool = True,
 ) -> dict:
     """
     生成关注池与 3～5 注单式。
@@ -491,6 +541,11 @@ def generate_recommendations(
         key=lambda n: (bs[n], -n),
         reverse=True,
     )[:2] or [1, 2]
+    crowd_model = fit_crowd_model(draws, market_rows or []) if market_rows else None
+    effective_crowd_weight = max(0.0, float(crowd_weight)) if crowd_model else 0.0
+    front_popularity_scorer = (
+        (lambda front: crowd_model.score(front, back_ref, draws)) if crowd_model else None
+    )
     sum_lo, sum_hi, sum_mean = sum_band(stats, 1.0)
     enum_lo, enum_hi = (sum_lo, sum_hi) if constrain_sum else (None, None)
 
@@ -548,9 +603,30 @@ def generate_recommendations(
     back_pairs = _pair_residuals(draws, "back", BACK_N)
     n = min(max(ticket_count, 3), 5)
     selected_fronts = _select_diverse_fronts(
-        fronts, fs, n, front_pairs, shape, front_odd, tier_scores=raw_fs
+        fronts,
+        fs,
+        n,
+        front_pairs,
+        shape,
+        front_odd,
+        tier_scores=raw_fs,
+        popularity_scorer=front_popularity_scorer,
+        popularity_weight=effective_crowd_weight,
     )
-    backs = _pick_backs(bs, back_excl, back_focus, back_odd, n, back_pairs)
+    front_anchor = sorted(eligible_f, key=lambda number: (fs[number], -number), reverse=True)[:5]
+    back_popularity_scorer = (
+        (lambda back: crowd_model.score(front_anchor, back, draws)) if crowd_model else None
+    )
+    backs = _pick_backs(
+        bs,
+        back_excl,
+        back_focus,
+        back_odd,
+        n,
+        back_pairs,
+        back_popularity_scorer,
+        effective_crowd_weight,
+    )
     if not backs:
         backs = [[1, 2]]
     back_pool = sorted({n for b in backs for n in b})
@@ -601,14 +677,48 @@ def generate_recommendations(
             }
         )
 
+    if crowd_model and tickets:
+        crowd_values = [
+            crowd_model.expected_first_winners_per_100m(
+                ticket["front"], ticket["back"], draws
+            )
+            for ticket in tickets
+        ]
+        order = sorted(range(len(tickets)), key=lambda index: crowd_values[index])
+        labels = ["中"] * len(tickets)
+        low_count = max(1, len(tickets) // 3)
+        high_count = max(1, len(tickets) // 3)
+        for index in order[:low_count]:
+            labels[index] = "低"
+        for index in order[-high_count:]:
+            labels[index] = "高"
+        for index, ticket in enumerate(tickets):
+            ticket["crowd_score"] = round(crowd_values[index], 3)
+            ticket["crowd_level"] = labels[index]
+            ticket["crowd_basis"] = "官方销量与一等奖注数"
+            ticket["popularity_proxy"] = round(crowd_values[index], 3)
+    else:
+        for ticket in tickets:
+            ticket["crowd_score"] = ticket.get("popularity_proxy", 0.0)
+            ticket["crowd_level"] = "启发式"
+            ticket["crowd_basis"] = "号码形态代理"
+
     if any(zone3(ticket["front"]) != shape for ticket in tickets):
         constraints_relaxed.append("部分单式形态（用于减少五注绑号）")
     if front_odd >= 0 and any(odd_even(ticket["front"])[0] != front_odd for ticket in tickets):
         if "前区奇偶" not in constraints_relaxed:
             constraints_relaxed.append("前区奇偶")
 
-    front_reference = walk_forward_reference(draws, "front", FRONT_N, len(front_pool))
-    back_reference = walk_forward_reference(draws, "back", BACK_N, len(back_pool))
+    front_reference = (
+        walk_forward_reference(draws, "front", FRONT_N, len(front_pool))
+        if include_reference
+        else {}
+    )
+    back_reference = (
+        walk_forward_reference(draws, "back", BACK_N, len(back_pool))
+        if include_reference
+        else {}
+    )
     front_order = sorted(
         range(1, FRONT_N + 1),
         key=lambda number: (raw_fs[number], -number),
@@ -635,6 +745,7 @@ def generate_recommendations(
         "data_cutoff_period": draws[-1].get("period", ""),
         "data_cutoff_date": draws[-1].get("date", ""),
         "constraints_relaxed": constraints_relaxed,
+        "crowd_weight": effective_crowd_weight,
     }
     return {
         "front_pool": front_pool,
@@ -656,6 +767,15 @@ def generate_recommendations(
             "back_ranking": back_order,
             "front_reference": front_reference,
             "back_reference": back_reference,
+            "crowd": (
+                {**crowd_model.detail(), "validation": load_market_validation()}
+                if crowd_model
+                else {
+                    "version": "heuristic-only",
+                    "samples": 0,
+                    "reason": "官方销量样本不足",
+                }
+            ),
             "warning": "回测覆盖率不是单号概率；低人气分不改变开奖概率。",
         },
     }

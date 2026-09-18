@@ -8,9 +8,9 @@ from typing import Optional
 from urllib.error import URLError, HTTPError
 from urllib.request import Request, urlopen
 
-SPORTTERY_URL = (
+SPORTTERY_URL_TMPL = (
     "https://webapi.sporttery.cn/gateway/lottery/getHistoryPageListV1.qry"
-    "?gameNo=85&provinceId=0&pageSize=30&isVerify=1&pageNo=1"
+    "?gameNo=85&provinceId=0&pageSize={page_size}&isVerify=1&pageNo={page_no}"
 )
 SOURCE_500_TMPL = "https://datachart.500.com/dlt/history/newinc/history.php?start={start}&end={end}"
 
@@ -48,7 +48,42 @@ def parse_sporttery_json(text: str) -> list[dict]:
             continue
         if not date:
             continue
-        rows.append({"period": period, "date": date, "front": front, "back": back})
+        prize_counts = {}
+        prize_amounts = {}
+        for prize in it.get("prizeLevelList") or []:
+            group = str(prize.get("group") or "").strip()
+            if not group:
+                continue
+            try:
+                prize_counts[group] = int(str(prize.get("stakeCount") or "0").replace(",", ""))
+            except ValueError:
+                prize_counts[group] = 0
+            try:
+                prize_amounts[group] = int(
+                    str(prize.get("stakeAmountFormat") or "0").replace(",", "")
+                )
+            except ValueError:
+                prize_amounts[group] = 0
+        try:
+            sales = int(str(it.get("totalSaleAmount") or "0").replace(",", ""))
+        except ValueError:
+            sales = 0
+        try:
+            pool_balance = float(str(it.get("poolBalanceAfterdraw") or "0").replace(",", ""))
+        except ValueError:
+            pool_balance = 0.0
+        rows.append(
+            {
+                "period": period,
+                "date": date,
+                "front": front,
+                "back": back,
+                "sales": sales,
+                "pool_balance": pool_balance,
+                "prize_counts": prize_counts,
+                "prize_amounts": prize_amounts,
+            }
+        )
     rows.sort(key=lambda r: (r["date"], r["period"]))
     return _dedupe(rows)
 
@@ -95,9 +130,9 @@ def _dedupe(rows: list[dict]) -> list[dict]:
     return uniq
 
 
-def fetch_sporttery() -> list[dict]:
+def fetch_sporttery(page_size: int = 100, page_no: int = 1) -> list[dict]:
     raw = _http_get(
-        SPORTTERY_URL,
+        SPORTTERY_URL_TMPL.format(page_size=page_size, page_no=page_no),
         extra_headers={
             "Referer": "https://www.lottery.gov.cn/",
             "Accept": "application/json, text/plain, */*",
@@ -108,6 +143,24 @@ def fetch_sporttery() -> list[dict]:
     if not rows:
         raise RuntimeError("体彩接口未解析到开奖记录")
     return rows
+
+
+def fetch_sporttery_market_history(max_pages: int = 20) -> list[dict]:
+    """抓取官方仍提供销量与奖级注数的完整历史段。"""
+    rows = []
+    empty_market_pages = 0
+    for page_no in range(1, max_pages + 1):
+        page = fetch_sporttery(page_size=100, page_no=page_no)
+        market_page = [row for row in page if row.get("sales") and row.get("prize_counts")]
+        if not market_page:
+            empty_market_pages += 1
+            if empty_market_pages >= 1:
+                break
+            continue
+        empty_market_pages = 0
+        rows.extend(market_page)
+    rows.sort(key=lambda row: (row["date"], row["period"]))
+    return _dedupe(rows)
 
 
 def fetch_500(start: str, end: str) -> list[dict]:

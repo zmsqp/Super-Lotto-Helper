@@ -124,6 +124,10 @@ class LogTab(QWidget):
                 session.get("hit_front") != comparison["best_front"]
                 or session.get("hit_back") != comparison["best_back"]
                 or any("grade" not in ticket for ticket in session.get("tickets") or [])
+                or any(
+                    old.get("grade") != new.get("grade")
+                    for old, new in zip(session.get("tickets") or [], comparison["tickets"])
+                )
             )
             if needs_update:
                 self.store.update_session_hits(

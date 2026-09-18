@@ -1,0 +1,200 @@
+{
+  "model_version": "ensemble-coverage-v2.2+official-sales-crowd-v1",
+  "data": {
+    "draws": 2924,
+    "market_rows": 1526,
+    "market_range": [
+      "16078",
+      "26106"
+    ],
+    "development_range": [
+      "22009",
+      "23058"
+    ],
+    "locked_test_range": [
+      "23059",
+      "26106"
+    ]
+  },
+  "official_market": {
+    "draws": 1526,
+    "mean_sales": 276923280.1671035,
+    "mean_first_prize_stakes": 5.1585845347313235,
+    "zero_first_prize_rate": 0.05111402359108781,
+    "mean_grade_2_7_stakes": 2135788.595019659
+  },
+  "crowd_model_validation": {
+    "available": true,
+    "version": "official-sales-crowd-v1",
+    "samples": 300,
+    "correlation": 0.18275,
+    "model_mae": 0.33761,
+    "baseline_mae": 0.34868,
+    "low_quartile_actual": 0.91386,
+    "high_quartile_actual": 1.0832,
+    "actual_draw_mean_popularity_percentile": 0.5055,
+    "control_hypothesis_two_sided_p": 0.7414,
+    "control_hypothesis_supported": false,
+    "deployable": true,
+    "conclusion": "样本外可用于降低潜在分奖人数"
+  },
+  "development": {
+    "0.0": {
+      "draws": 200,
+      "any_prize_hits": 57,
+      "any_prize_rate": 0.285,
+      "grade_2_7_hits": 57,
+      "grade_2_7_rate": 0.285,
+      "grade_2_5_hits": 0,
+      "grade_2_5_rate": 0.0,
+      "mean_crowd": 1.6569895314467018,
+      "rolling_8_grade_2_7": [
+        0.2,
+        0.2,
+        0.36,
+        0.4,
+        0.24,
+        0.32,
+        0.28,
+        0.28
+      ]
+    },
+    "0.05": {
+      "draws": 200,
+      "any_prize_hits": 56,
+      "any_prize_rate": 0.28,
+      "grade_2_7_hits": 56,
+      "grade_2_7_rate": 0.28,
+      "grade_2_5_hits": 0,
+      "grade_2_5_rate": 0.0,
+      "mean_crowd": 1.6480049381729163,
+      "rolling_8_grade_2_7": [
+        0.24,
+        0.28,
+        0.32,
+        0.4,
+        0.28,
+        0.24,
+        0.28,
+        0.2
+      ]
+    },
+    "0.1": {
+      "draws": 200,
+      "any_prize_hits": 49,
+      "any_prize_rate": 0.245,
+      "grade_2_7_hits": 49,
+      "grade_2_7_rate": 0.245,
+      "grade_2_5_hits": 0,
+      "grade_2_5_rate": 0.0,
+      "mean_crowd": 1.636100730388513,
+      "rolling_8_grade_2_7": [
+        0.2,
+        0.2,
+        0.36,
+        0.32,
+        0.24,
+        0.24,
+        0.2,
+        0.2
+      ]
+    },
+    "0.2": {
+      "draws": 200,
+      "any_prize_hits": 55,
+      "any_prize_rate": 0.275,
+      "grade_2_7_hits": 55,
+      "grade_2_7_rate": 0.275,
+      "grade_2_5_hits": 0,
+      "grade_2_5_rate": 0.0,
+      "mean_crowd": 1.6098047497405363,
+      "rolling_8_grade_2_7": [
+        0.32,
+        0.24,
+        0.36,
+        0.36,
+        0.28,
+        0.28,
+        0.24,
+        0.12
+      ]
+    }
+  },
+  "selection_rule": "开发段2–7等奖率距最优不超过1个百分点时，选择人气风险最低权重",
+  "selected_weight": 0.2,
+  "locked_test": {
+    "legacy_baseline": {
+      "draws": 500,
+      "any_prize_hits": 135,
+      "any_prize_rate": 0.27,
+      "grade_2_7_hits": 135,
+      "grade_2_7_rate": 0.27,
+      "grade_2_5_hits": 2,
+      "grade_2_5_rate": 0.004,
+      "mean_crowd": 1.7346927708791415,
+      "rolling_8_grade_2_7": [
+        0.3225806451612903,
+        0.2857142857142857,
+        0.23809523809523808,
+        0.3064516129032258,
+        0.3064516129032258,
+        0.25396825396825395,
+        0.2222222222222222,
+        0.22580645161290322
+      ]
+    },
+    "official_model_weight_0": {
+      "draws": 500,
+      "any_prize_hits": 137,
+      "any_prize_rate": 0.274,
+      "grade_2_7_hits": 137,
+      "grade_2_7_rate": 0.274,
+      "grade_2_5_hits": 2,
+      "grade_2_5_rate": 0.004,
+      "mean_crowd": 1.730715523139576,
+      "rolling_8_grade_2_7": [
+        0.3064516129032258,
+        0.31746031746031744,
+        0.25396825396825395,
+        0.3064516129032258,
+        0.3225806451612903,
+        0.23809523809523808,
+        0.20634920634920634,
+        0.24193548387096775
+      ]
+    },
+    "payout_aware": {
+      "draws": 500,
+      "any_prize_hits": 134,
+      "any_prize_rate": 0.268,
+      "grade_2_7_hits": 134,
+      "grade_2_7_rate": 0.268,
+      "grade_2_5_hits": 2,
+      "grade_2_5_rate": 0.004,
+      "mean_crowd": 1.6859434913158466,
+      "rolling_8_grade_2_7": [
+        0.27419354838709675,
+        0.3492063492063492,
+        0.2698412698412698,
+        0.2903225806451613,
+        0.3225806451612903,
+        0.2857142857142857,
+        0.19047619047619047,
+        0.16129032258064516
+      ]
+    },
+    "paired_vs_legacy": {
+      "candidate_only_wins": 42,
+      "baseline_only_wins": 43,
+      "one_sided_p": 0.5857883629175499
+    },
+    "crowd_reduction_vs_legacy": 0.02810254379430477
+  },
+  "conclusion": {
+    "win_rate_improved": false,
+    "win_rate_significantly_improved": false,
+    "crowd_risk_reduced": true,
+    "control_hypothesis_supported": false,
+    "deployment_rule": "低人气仅作为同等开奖评分的轻量择优，不改变开奖概率"
+  }
+}

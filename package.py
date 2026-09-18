@@ -10,10 +10,12 @@ import PyInstaller.__main__
 
 ROOT = Path(__file__).resolve().parent
 SEED_CSV = ROOT / "assets" / "dlt_history.csv"
+MARKET_SEED = ROOT / "assets" / "dlt_market_history.json"
+MARKET_VALIDATION = ROOT / "assets" / "dlt_market_validation.json"
 if not SEED_CSV.exists():
     SEED_CSV = ROOT.parent / "1" / "dlt_history.csv"
-DIST = ROOT / "dist_v2_1"
-EXE_NAME = "大乐透统计与记录_v2.1"
+DIST = ROOT / "dist_v2_2"
+EXE_NAME = "大乐透统计与记录_v2.2"
 
 
 def copy_database(source: Path, target: Path) -> None:
@@ -26,6 +28,8 @@ def copy_database(source: Path, target: Path) -> None:
 def main() -> None:
     if not SEED_CSV.exists():
         raise FileNotFoundError(f"未找到种子开奖 CSV：{SEED_CSV}")
+    if not MARKET_SEED.exists() or not MARKET_VALIDATION.exists():
+        raise FileNotFoundError("未找到官方销量历史或人气层回测结果")
 
     PyInstaller.__main__.run(
         [
@@ -39,6 +43,8 @@ def main() -> None:
             "--hidden-import",
             "PyQt5.sip",
             f"--add-data={SEED_CSV}{os.pathsep}assets",
+            f"--add-data={MARKET_SEED}{os.pathsep}assets",
+            f"--add-data={MARKET_VALIDATION}{os.pathsep}assets",
             "--distpath",
             str(DIST),
             "--workpath",
@@ -50,7 +56,11 @@ def main() -> None:
     # 独立版本目录不覆盖旧程序，首次打包时继承上一版用户数据库和推测日志。
     dst_db_dir = DIST / "data"
     target = dst_db_dir / "dlt.db"
-    sources = [ROOT / "dist_v2" / "data" / "dlt.db", ROOT / "data" / "dlt.db"]
+    sources = [
+        ROOT / "dist_v2_1" / "data" / "dlt.db",
+        ROOT / "dist_v2" / "data" / "dlt.db",
+        ROOT / "data" / "dlt.db",
+    ]
     source = next((item for item in sources if item.exists()), None)
     if source is not None and not target.exists():
         copy_database(source, target)

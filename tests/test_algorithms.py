@@ -13,10 +13,18 @@ from services.stats import fair_pool_coverage, prize_grade
 
 
 class PrizeTests(unittest.TestCase):
-    def test_nine_prize_includes_back_pair_only(self):
-        self.assertEqual(prize_grade(0, 2), 9)
-        self.assertEqual(prize_grade(3, 0), 9)
+    def test_seventh_prize_includes_back_pair_only(self):
+        self.assertEqual(prize_grade(0, 2), 7)
+        self.assertEqual(prize_grade(3, 0), 7)
         self.assertIsNone(prize_grade(1, 1))
+
+    def test_current_seven_grade_merges_old_fixed_levels(self):
+        self.assertEqual(prize_grade(5, 0), 3)
+        self.assertEqual(prize_grade(4, 2), 3)
+        self.assertEqual(prize_grade(4, 0), 5)
+        self.assertEqual(prize_grade(3, 2), 5)
+        self.assertEqual(prize_grade(3, 1), 6)
+        self.assertEqual(prize_grade(2, 2), 6)
 
     def test_comparison_uses_best_ticket_not_first_ticket(self):
         tickets = [
@@ -26,7 +34,7 @@ class PrizeTests(unittest.TestCase):
         draw = {"front": [6, 7, 8, 30, 31], "back": [9, 10]}
         compared, front_hits, back_hits = compare_tickets(tickets, draw)
         self.assertEqual((front_hits, back_hits), (3, 0))
-        self.assertEqual(compared[1]["grade"], 9)
+        self.assertEqual(compared[1]["grade"], 7)
 
     def test_pool_and_ticket_hits_are_separate(self):
         tickets = [

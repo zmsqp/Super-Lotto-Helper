@@ -1,0 +1,17 @@
+{
+  "version": "ensemble-coverage-v2.2+official-sales-crowd-v1",
+  "market_rows": 1526,
+  "locked_draws": 500,
+  "locked_range": [
+    "23059",
+    "26106"
+  ],
+  "selected_weight": 0.2,
+  "baseline_rate": 0.27,
+  "payout_aware_rate": 0.268,
+  "grade_2_5_hits": 2,
+  "paired_p": 0.5857883629175499,
+  "crowd_reduction": 0.02810254379430477,
+  "control_hypothesis_supported": false,
+  "control_hypothesis_p": 0.7414
+}

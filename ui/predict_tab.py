@@ -267,6 +267,7 @@ class PredictTab(QWidget):
             back_odd=int(self.back_oe.currentData()),
             ticket_count=self.ticket_spin.value(),
             constrain_sum=self.sum_check.isChecked(),
+            market_rows=self.store.list_market_asc(),
         )
         if result.get("error"):
             QMessageBox.warning(self, "无法生成", result["error"])
@@ -306,6 +307,21 @@ class PredictTab(QWidget):
         )
         if params.get("constraints_relaxed"):
             lines.append(f"组合不足，已自动放宽：{'、'.join(params['constraints_relaxed'])}")
+        crowd = model.get("crowd") or {}
+        if crowd.get("samples"):
+            period_range = crowd.get("period_range") or ["—", "—"]
+            lines.append(
+                f"公众选号集中度 {crowd.get('version')}：官方{crowd.get('samples')}期"
+                f"（{period_range[0]}–{period_range[-1]}）；仅估算分奖风险，不改变开奖概率"
+            )
+            crowd_validation = crowd.get("validation") or {}
+            if crowd_validation.get("locked_draws"):
+                lines.append(
+                    f"人气层锁定{crowd_validation['locked_draws']}期：2–7等奖率"
+                    f"{crowd_validation['baseline_rate']:.1%}→{crowd_validation['payout_aware_rate']:.1%}，"
+                    f"分奖风险降低{crowd_validation['crowd_reduction']:.1%}；"
+                    f"未发现开奖命中率提升"
+                )
         excl_f = marks["front"]["exclude"]
         excl_b = marks["back"]["exclude"]
         if excl_f:
@@ -320,6 +336,7 @@ class PredictTab(QWidget):
                 f"    前区和{t.get('front_sum', sum(t['front']))}（{t.get('sum_flag', '')}）"
                 f"  后区和{t.get('back_sum', sum(t['back']))}  {t.get('role', '')}"
                 f"  分层{''.join(str(x) for x in t.get('tier_pattern', []))}"
+                f"  人气{t.get('crowd_level', '—')}({t.get('crowd_score', 0):.2f})"
             )
         self.result_edit.setPlainText("\n".join(lines))
 
