@@ -18,8 +18,22 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from services.algorithms import SINGLE_SHAPES, generate_recommendations
-from services.stats import format_nums, next_draw_meta, pattern_stats, slice_draws, sum_band, zone_shape_counts
+from services.algorithms import (
+    ODD_EVEN_ANY,
+    ODD_EVEN_INFER,
+    SHAPE_INFER,
+    SINGLE_SHAPES,
+    generate_recommendations,
+)
+from services.stats import (
+    format_nums,
+    next_draw_meta,
+    odd_even_counts,
+    pattern_stats,
+    slice_draws,
+    sum_band,
+    zone_shape_counts,
+)
 from ui.number_board import NumberBoard
 
 WINDOW_OPTIONS = [
@@ -38,8 +52,23 @@ MODE_OPTIONS = [
     ("EWMA20", "ewma20"),
     ("EWMA50", "ewma50"),
 ]
-FRONT_OE = [("3:2", 3), ("2:3", 2), ("不限", -1)]
-BACK_OE = [("1:1", 1), ("不限", -1)]
+FRONT_OE = [
+    ("历史推理", ODD_EVEN_INFER),
+    ("不限", ODD_EVEN_ANY),
+    ("5:0", 5),
+    ("4:1", 4),
+    ("3:2", 3),
+    ("2:3", 2),
+    ("1:4", 1),
+    ("0:5", 0),
+]
+BACK_OE = [
+    ("历史推理", ODD_EVEN_INFER),
+    ("不限", ODD_EVEN_ANY),
+    ("2:0", 2),
+    ("1:1", 1),
+    ("0:2", 0),
+]
 
 
 class PredictTab(QWidget):
@@ -102,6 +131,7 @@ class PredictTab(QWidget):
         for text, val in WINDOW_OPTIONS:
             self.window_combo.addItem(text, val)
         self.window_combo.setCurrentIndex(2)
+        self.window_combo.currentIndexChanged.connect(self._refresh_zone_rank)
         row1.addWidget(self.window_combo)
         row1.addWidget(QLabel("打分"))
         self.mode_combo = QComboBox()
@@ -119,18 +149,23 @@ class PredictTab(QWidget):
         self.sum_label.setWordWrap(True)
         self.sum_label.setObjectName("subtitleLabel")
         al.addWidget(self.sum_label)
+        self.oe_rank_label = QLabel("奇偶排行：—")
+        self.oe_rank_label.setWordWrap(True)
+        self.oe_rank_label.setObjectName("subtitleLabel")
+        al.addWidget(self.oe_rank_label)
 
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("单式形态"))
         self.shape_combo = QComboBox()
+        self.shape_combo.addItem("历史推理", SHAPE_INFER)
         for key in SINGLE_SHAPES:
             a, b, c = SINGLE_SHAPES[key]
             self.shape_combo.addItem(f"{key}（{a}+{b}+{c}）", key)
         row2.addWidget(self.shape_combo)
-        self.duplex_check = QCheckBox("232 复式池（一区2+二区3+三区2，共7码）")
+        self.duplex_check = QCheckBox("7码复式池（三区个数历史推理，共7码）")
         self.duplex_check.setChecked(True)
         row2.addWidget(self.duplex_check)
-        self.sum_check = QCheckBox("约束和值到均值±σ")
+        self.sum_check = QCheckBox("参考历史和值（各注分开推理）")
         self.sum_check.setChecked(True)
         row2.addWidget(self.sum_check)
         row2.addStretch(1)
@@ -202,6 +237,7 @@ class PredictTab(QWidget):
         if not use:
             self.zone_rank_label.setText("三区形态排行：无数据")
             self.sum_label.setText("前区和值：无数据")
+            self.oe_rank_label.setText("奇偶排行：无数据")
             return
         ranks = zone_shape_counts(use)
         top = "　".join(f"{k} {v}次" for k, v in ranks[:8])
@@ -212,6 +248,9 @@ class PredictTab(QWidget):
             f"前区和值：近窗均值 {mean:.1f}（σ {pstats['front_sum_std']:.1f}），"
             f"常用区间 {lo}–{hi}；后区和均值 {pstats['back_sum_mean']:.1f}"
         )
+        front_oe = "　".join(f"{name} {count}次" for name, count in odd_even_counts(use, "front"))
+        back_oe = "　".join(f"{name} {count}次" for name, count in odd_even_counts(use, "back"))
+        self.oe_rank_label.setText(f"近窗奇偶排行：前区 {front_oe}；后区 {back_oe}")
 
     def _persist_marks(self) -> None:
         if self._silent or not self.target_period:
@@ -282,7 +321,10 @@ class PredictTab(QWidget):
         )
         lines.append(f"前区{_fmt_dans(result.get('front_dans') or {})}")
         lines.append(f"后区{_fmt_dans(result.get('back_dans') or {})}")
-        lines.append(f"232 复式池：{format_nums(result['duplex_232'])}")
+        params = result.get("params") or {}
+        if result.get("duplex_232"):
+            duplex_label = params.get("duplex_label") or "7码"
+            lines.append(f"本期复式池 {duplex_label}：{format_nums(result['duplex_232'])}")
         lines.append(f"前区关注池：{format_nums(result['front_pool'])}")
         lines.append(f"后区关注池：{format_nums(result['back_pool'])}")
         model = result.get("model") or {}
@@ -300,7 +342,6 @@ class PredictTab(QWidget):
                 f"后区{back_ref.get('pool_size')}号池样本外覆盖2枚："
                 f"{back_ref.get('coverage_rate', 0):.1%}（公平基准 {back_ref.get('fair_rate', 0):.1%}，{back_status}）"
             )
-        params = result.get("params") or {}
         lines.append(
             f"模型 {params.get('model_version', 'legacy')}　"
             f"数据截止 {params.get('data_cutoff_period', '—')}（{params.get('data_cutoff_date', '—')}）"
@@ -328,12 +369,23 @@ class PredictTab(QWidget):
             lines.append(f"已排除前区：{format_nums(excl_f)}")
         if excl_b:
             lines.append(f"已排除后区：{format_nums(excl_b)}")
+        lines.extend(_odd_infer_lines("前区", params.get("front_odd_infer"), params.get("front_odd_plan")))
+        lines.extend(_odd_infer_lines("后区", params.get("back_odd_infer"), params.get("back_odd_plan")))
+        lines.extend(_shape_infer_lines(params.get("shape_infer"), params.get("shape_plan")))
+        lines.extend(_duplex_infer_lines(params.get("duplex_infer")))
+        lines.extend(_sum_infer_lines(params.get("sum_infer"), params.get("sum_plan")))
         lines.append("")
         for t in result["tickets"]:
+            target_note = ""
+            if t.get("target_shape"):
+                target_note += f"  目标形态{t['target_shape']}"
+            if t.get("target_sum") is not None:
+                target_note += f"  目标和值{t['target_sum']}"
             lines.append(
                 f"{t['name']}  {format_nums(t['front'])}  +  {format_nums(t['back'])}"
                 f"    形态{t['shape']}  前区{t['odd_even']}  后区{t['back_oe']}"
                 f"    前区和{t.get('front_sum', sum(t['front']))}（{t.get('sum_flag', '')}）"
+                f"{target_note}"
                 f"  后区和{t.get('back_sum', sum(t['back']))}  {t.get('role', '')}"
                 f"  分层{''.join(str(x) for x in t.get('tier_pattern', []))}"
                 f"  人气{t.get('crowd_level', '—')}({t.get('crowd_score', 0):.2f})"
@@ -400,7 +452,12 @@ class PredictTab(QWidget):
         if pool.get("back_dans"):
             lines.append(f"后区{_fmt_dans(pool['back_dans'])}")
         if pool.get("duplex_232"):
-            lines.append(f"232 复式池：{format_nums(pool['duplex_232'])}")
+            loaded_label = params.get("duplex_label") or ""
+            prefix = f"本期复式池 {loaded_label}：" if loaded_label else "复式池："
+            lines.append(prefix + format_nums(pool["duplex_232"]))
+        lines.extend(_shape_infer_lines(params.get("shape_infer"), params.get("shape_plan")))
+        lines.extend(_duplex_infer_lines(params.get("duplex_infer")))
+        lines.extend(_sum_infer_lines(params.get("sum_infer"), params.get("sum_plan")))
         for t in tickets:
             lines.append(
                 f"{t.get('name', '')}  {format_nums(t.get('front') or [])}  +  {format_nums(t.get('back') or [])}"
@@ -434,3 +491,78 @@ def _fmt_dans(dans: dict) -> str:
     silver = format_nums(dans.get("silver") or []) or "—"
     bronze = format_nums(dans.get("bronze") or []) or "—"
     return f"金胆 {gold}　银胆 {silver}　铜胆 {bronze}"
+
+
+def _shape_infer_lines(detail: dict | None, plan: list | None) -> list[str]:
+    """票面前的形态得分、近窗次数和本期各注分配。"""
+    if not detail:
+        return []
+    lines = ["前区形态推理："]
+    for row in detail.get("ranking") or []:
+        lines.append(
+            f"  {row.get('shape')}（{row.get('label') or ''}）　得分 {float(row.get('score') or 0):.3f}"
+            f"　近窗 {int(row.get('window_count') or 0)} 次"
+        )
+    ratios = list(plan or detail.get("targets") or [])
+    if ratios:
+        alloc = "　".join(f"第{index + 1}注 {shape}" for index, shape in enumerate(ratios))
+        lines.append(f"本期形态分配：{alloc}")
+    return lines
+
+
+def _duplex_infer_lines(detail: dict | None) -> list[str]:
+    """写明本期共享复式池是几+几+几，并附上各结构得分。"""
+    if not detail:
+        return []
+    label = detail.get("actual_label") or detail.get("label") or ""
+    sampled = detail.get("label") or ""
+    head = f"本期复式池：{label}"
+    if sampled and label and sampled != label:
+        head += f"（推理 {sampled}，取号未凑满）"
+    lines = [head]
+    for row in detail.get("ranking") or []:
+        lines.append(
+            f"  {row.get('label')}　得分 {float(row.get('score') or 0):.3f}"
+            f"　近窗 {int(row.get('window_count') or 0)} 次"
+        )
+    return lines
+
+
+def _sum_infer_lines(detail: dict | None, plan: list | None) -> list[str]:
+    """票面前写明各注目标和值，并给出高分箱的得分和近窗次数。"""
+    if not detail:
+        return []
+    lines = ["前区和值推理："]
+    ranking = list(detail.get("ranking") or [])
+    shown = ranking[:8]
+    shown_sums = {row.get("sum") for row in shown}
+    for row in ranking:
+        if row.get("sum") in set(plan or []) and row.get("sum") not in shown_sums:
+            shown.append(row)
+            shown_sums.add(row.get("sum"))
+    for row in shown:
+        lines.append(
+            f"  目标 {row.get('sum')}　得分 {float(row.get('score') or 0):.3f}"
+            f"　近窗 {int(row.get('window_count') or 0)} 次"
+        )
+    if plan:
+        alloc = "　".join(f"第{index + 1}注 {value}" for index, value in enumerate(plan))
+        lines.append(f"本期和值分配：{alloc}")
+    return lines
+
+
+def _odd_infer_lines(title: str, detail: dict | None, plan: list | None) -> list[str]:
+    """推荐结果里、票面之前的奇偶得分、近窗次数和本期分配。"""
+    if not detail:
+        return []
+    lines = [f"{title}奇偶推理："]
+    for row in detail.get("ranking") or []:
+        lines.append(
+            f"  {row.get('ratio')}　得分 {float(row.get('score') or 0):.3f}"
+            f"　近窗 {int(row.get('window_count') or 0)} 次"
+        )
+    ratios = list(plan or detail.get("target_ratios") or [])
+    if ratios:
+        alloc = "　".join(f"第{index + 1}注 {ratio}" for index, ratio in enumerate(ratios))
+        lines.append(f"本期{title}分配：{alloc}")
+    return lines

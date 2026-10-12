@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from services.algorithms import comparison_summary
+from services.algorithms import ODD_EVEN_ANY, ODD_EVEN_INFER, SHAPE_INFER, comparison_summary
 from services.stats import format_nums
 
 
@@ -186,8 +186,8 @@ class LogTab(QWidget):
         if params:
             lines.append(
                 f"参数：窗口{params.get('window')}  模式{params.get('mode')}  "
-                f"形态{params.get('shape_key')}  232复式={params.get('use_duplex_232')}  "
-                f"前区奇偶奇数{params.get('front_odd')}  后区{params.get('back_odd')}"
+                f"{_format_structure_param(params)}  "
+                f"{_format_odd_even_param(params)}"
             )
         marks = s.get("marks") or {}
         ff = (marks.get("front") or {}).get("focus") or []
@@ -212,7 +212,9 @@ class LogTab(QWidget):
                 f"铜胆 {format_nums(bd.get('bronze') or []) or '—'}"
             )
         if pool.get("duplex_232"):
-            lines.append(f"232 池：{format_nums(pool['duplex_232'])}")
+            label = params.get("duplex_label") or ""
+            prefix = f"复式池 {label}：" if label else "复式池："
+            lines.append(prefix + format_nums(pool["duplex_232"]))
         lines.append("")
         for t in s.get("tickets") or []:
             extra = ""
@@ -308,3 +310,44 @@ class LogTab(QWidget):
             return
         self.detail.clear()
         self.reload()
+
+
+def _format_structure_param(params: dict) -> str:
+    """参数行写出形态、复式池、和值是历史推理还是手动，并带上分配。"""
+    shape_key = params.get("shape_key")
+    if shape_key == SHAPE_INFER or params.get("shape_infer"):
+        plan = params.get("shape_plan") or []
+        shape_text = "形态历史推理 " + ("、".join(str(item) for item in plan) if plan else "—")
+    else:
+        shape_text = f"形态{shape_key}"
+    if not params.get("use_duplex_232"):
+        duplex_text = "复式池关"
+    elif params.get("duplex_infer") or params.get("duplex_label"):
+        duplex_text = f"复式池历史推理 {params.get('duplex_label') or params.get('duplex_shape') or '—'}"
+    else:
+        duplex_text = "232复式=开"
+    if not params.get("constrain_sum"):
+        sum_text = "和值不参考"
+    elif params.get("sum_infer") or params.get("sum_plan"):
+        plan = params.get("sum_plan") or []
+        sum_text = "和值历史推理 " + ("、".join(str(item) for item in plan) if plan else "—")
+    else:
+        sum_text = "和值约束=开"
+    return f"{shape_text}  {duplex_text}  {sum_text}"
+
+
+def _format_odd_even_param(params: dict) -> str:
+    """参数行：历史推理写出各注分配，不限和硬约束仍显示原来的含义。"""
+
+    def one(side: str) -> str:
+        name = "前区" if side == "front" else "后区"
+        odd = params.get(f"{side}_odd")
+        plan = params.get(f"{side}_odd_plan") or []
+        if odd == ODD_EVEN_INFER:
+            alloc = "、".join(str(item) for item in plan) if plan else "—"
+            return f"{name}历史推理 {alloc}"
+        if odd == ODD_EVEN_ANY:
+            return f"{name}不限"
+        return f"{name}奇偶奇数{odd}"
+
+    return f"{one('front')}  {one('back')}"

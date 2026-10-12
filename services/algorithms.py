@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""时间序列号码评分、232 缩号、覆盖组合优化与开奖对照。"""
+"""时间序列号码评分、奇偶/形态/和值历史推理、7 码复式池、覆盖组合优化与开奖对照。"""
 from __future__ import annotations
 
 import math
+import random
 from collections import Counter
 from itertools import combinations
 from typing import Callable
@@ -36,11 +37,40 @@ SINGLE_SHAPES = {
     "131": (1, 3, 1),
     "113": (1, 1, 3),
 }
-# 232 复式池：一区 2 + 二区 3 + 三区 2
+# 232 复式池的历史默认结构；勾选复式后实际个数改由历史推理决定。
 DUPLEX_232 = (2, 3, 2)
 FOCUS_BOOST = 0.25
 MODEL_VERSION = "ensemble-coverage-v2.2"
 _REFERENCE_CACHE: dict[tuple, dict] = {}
+
+# 与号码集成共用的多窗口贝叶斯收缩：(窗口, 先验强度, 权重)。窗口 0 表示全量。
+_ENSEMBLE_BAYES = (
+    (30, 60.0, 0.12),
+    (100, 100.0, 0.22),
+    (300, 200.0, 0.24),
+    (800, 400.0, 0.18),
+    (0, 800.0, 0.10),
+)
+_ENSEMBLE_TREND_WEIGHT = 0.08
+_ENSEMBLE_EWMA_WEIGHT = 0.06
+# 奇偶哨兵：-2 按历史推理分配各注，-1 不限，>=0 为奇数个数硬约束。
+ODD_EVEN_INFER = -2
+ODD_EVEN_ANY = -1
+# 单式形态哨兵：infer 按历史三区形态分配各注；其它键仍是手动形态。
+SHAPE_INFER = "infer"
+# 次高分低于最高分的该比例时视为可忽略，不再强行拆开最后一注。
+_OE_RUNNER_UP_MIN_RATIO = 0.12
+# 命中该注目标奇偶或目标形态的加分。高于同池号码分差，使分配跟得上。
+_OE_TARGET_BONUS = 5.0
+# 和值命中加分低于形态命中，避免两项抵消后五注又收成同一个形态。
+_SUM_TARGET_BONUS = 3.0
+# 前区和值分箱宽度。目标取箱中心，落在半宽内视为命中该注目标。
+_SUM_MIN = sum(range(1, FRONT_K + 1))
+_SUM_MAX = sum(range(FRONT_N - FRONT_K + 1, FRONT_N + 1))
+_SUM_BIN = 5
+_SUM_MATCH = _SUM_BIN // 2
+# 公平基准用二项分布：前区 35 个号 18 奇，后区 12 个号 6 奇。
+_POOL_ODD_RATE = {"front": 18 / 35, "back": 6 / 12}
 
 
 def _rank01(values: list[float], nmax: int) -> list[float]:
@@ -73,17 +103,17 @@ def ensemble_score_vector(draws: list[dict], key: str, nmax: int) -> tuple[list[
     if not draws:
         return [0.0] * (nmax + 1), {"components": []}
     components: list[tuple[str, float, list[float]]] = []
-    for window, prior, weight in ((30, 60.0, 0.12), (100, 100.0, 0.22), (300, 200.0, 0.24), (800, 400.0, 0.18), (0, 800.0, 0.10)):
+    for window, prior, weight in _ENSEMBLE_BAYES:
         values = _frequency_rate(draws, key, nmax, window, prior)
         components.append((f"bayes_{window or 'all'}", weight, _rank01(values, nmax)))
 
     recent = _frequency_rate(draws, key, nmax, 30, 60.0)
     medium = _frequency_rate(draws, key, nmax, 120, 120.0)
     trend = [0.0] + [recent[n] - medium[n] for n in range(1, nmax + 1)]
-    components.append(("dynamic_30_120", 0.08, _rank01(trend, nmax)))
+    components.append(("dynamic_30_120", _ENSEMBLE_TREND_WEIGHT, _rank01(trend, nmax)))
 
     ewma = score_vector(draws, key, nmax, "ewma50", 0)
-    components.append(("ewma50", 0.06, _rank01(ewma, nmax)))
+    components.append(("ewma50", _ENSEMBLE_EWMA_WEIGHT, _rank01(ewma, nmax)))
 
     scores = [0.0] * (nmax + 1)
     for _name, weight, ranked in components:
@@ -92,6 +122,496 @@ def ensemble_score_vector(draws: list[dict], key: str, nmax: int) -> tuple[list[
     return scores, {
         "version": MODEL_VERSION,
         "components": [{"name": name, "weight": weight} for name, weight, _ in components],
+    }
+
+
+def _binomial_fair(k: int, odd_rate: float) -> list[float]:
+    """奇数个数 0..k 的二项分布，用作频率收缩的公平基准。"""
+    return [
+        math.comb(k, odd_n) * (odd_rate ** odd_n) * ((1.0 - odd_rate) ** (k - odd_n))
+        for odd_n in range(k + 1)
+    ]
+
+
+def _rank_values(values: list[float]) -> list[float]:
+    """转成 0..1 排名分。并列时较小下标靠前，与号码排名里较小号码优先一致。"""
+    order = list(range(len(values)))
+    order.sort(key=lambda index: (values[index], -index), reverse=True)
+    out = [0.0] * len(values)
+    denominator = max(len(values) - 1, 1)
+    for rank, index in enumerate(order):
+        out[index] = 1.0 - rank / denominator
+    return out
+
+
+def _odd_rate(draws: list[dict], key: str, k: int, window: int, prior: float, fair: list[float]) -> list[float]:
+    """各奇数个数的贝叶斯收缩频率。每一期恰好落入一个奇数个数。"""
+    use = slice_draws(draws, window)
+    counts = [0] * (k + 1)
+    for draw in use:
+        odd_n = odd_even(draw[key])[0]
+        if 0 <= odd_n <= k:
+            counts[odd_n] += 1
+    total = len(use)
+    return [(counts[odd_n] + prior * fair[odd_n]) / (total + prior) for odd_n in range(k + 1)]
+
+
+def _ewma_odd(draws: list[dict], key: str, k: int, span: int = 50) -> list[float]:
+    """奇数个数的指数加权出现得分，口径对齐号码模型的 ewma50。"""
+    alpha = 2.0 / (span + 1.0)
+    scores = [0.0] * (k + 1)
+    for draw in draws:
+        odd_n = odd_even(draw[key])[0]
+        for index in range(k + 1):
+            appeared = 1.0 if index == odd_n else 0.0
+            scores[index] = alpha * appeared + (1.0 - alpha) * scores[index]
+    return scores
+
+
+def _sample_odd_targets(scores: list[float], ticket_count: int, rng: random.Random) -> list[int]:
+    """按分数加权抽出每注目标；全相同且次高分不可忽略时，最后一注改到次高分。"""
+    weights = [max(float(score), 0.0) for score in scores]
+    if sum(weights) <= 0:
+        weights = [1.0] * len(scores)
+    targets = [rng.choices(range(len(scores)), weights=weights, k=1)[0] for _ in range(ticket_count)]
+    if ticket_count < 2 or len(scores) < 2 or len(set(targets)) > 1:
+        return targets
+    ranked = sorted(range(len(scores)), key=lambda index: (scores[index], -index), reverse=True)
+    top, second = ranked[0], ranked[1]
+    leader = float(scores[top])
+    runner = float(scores[second])
+    negligible = runner <= 0 or (leader > 0 and runner < leader * _OE_RUNNER_UP_MIN_RATIO)
+    if negligible:
+        return targets
+    # 抽成同一个比例时拆开最后一注；若抽中的本来就是次高，则改到最高，避免仍然锁死。
+    if targets[-1] != second:
+        targets[-1] = second
+    elif top != second:
+        targets[-1] = top
+    return targets
+
+
+def infer_odd_even(draws: list[dict], key: str, ticket_count: int, window: int = 0) -> dict:
+    """
+    按与号码评分相同的多窗口集成，给奇数个数打分并分配各注目标。
+    前区奇数个数 0–5，后区 0–2。同一批开奖、同一最近期号，分配结果不变。
+    """
+    if key not in ("front", "back"):
+        raise ValueError(key)
+    k = FRONT_K if key == "front" else BACK_K
+    fair = _binomial_fair(k, _POOL_ODD_RATE[key])
+    components: list[tuple[str, float, list[float]]] = []
+    if draws:
+        for bayes_window, prior, weight in _ENSEMBLE_BAYES:
+            rates = _odd_rate(draws, key, k, bayes_window, prior, fair)
+            components.append((f"bayes_{bayes_window or 'all'}", weight, _rank_values(rates)))
+        recent = _odd_rate(draws, key, k, 30, 60.0, fair)
+        medium = _odd_rate(draws, key, k, 120, 120.0, fair)
+        trend = [recent[odd_n] - medium[odd_n] for odd_n in range(k + 1)]
+        components.append(("dynamic_30_120", _ENSEMBLE_TREND_WEIGHT, _rank_values(trend)))
+        ewma = _ewma_odd(draws, key, k, 50)
+        components.append(("ewma50", _ENSEMBLE_EWMA_WEIGHT, _rank_values(ewma)))
+    else:
+        for bayes_window, _prior, weight in _ENSEMBLE_BAYES:
+            components.append((f"bayes_{bayes_window or 'all'}", weight, _rank_values(list(fair))))
+        components.append(("dynamic_30_120", _ENSEMBLE_TREND_WEIGHT, _rank_values([0.0] * (k + 1))))
+        components.append(("ewma50", _ENSEMBLE_EWMA_WEIGHT, _rank_values([0.0] * (k + 1))))
+
+    scores = [0.0] * (k + 1)
+    for _name, weight, ranked in components:
+        for odd_n in range(k + 1):
+            scores[odd_n] += weight * ranked[odd_n]
+
+    view_counts = [0] * (k + 1)
+    for draw in slice_draws(draws, window):
+        odd_n = odd_even(draw[key])[0]
+        if 0 <= odd_n <= k:
+            view_counts[odd_n] += 1
+
+    period = str(draws[-1].get("period", "")) if draws else ""
+    salt = "front-oe" if key == "front" else "back-oe"
+    rng = random.Random(f"{period}:{salt}")
+    targets = _sample_odd_targets(scores, max(int(ticket_count), 1), rng)
+    ranking = [
+        {
+            "ratio": f"{odd_n}:{k - odd_n}",
+            "odd": odd_n,
+            "score": round(float(scores[odd_n]), 6),
+            "window_count": view_counts[odd_n],
+        }
+        for odd_n in range(k + 1)
+    ]
+    ranking.sort(key=lambda row: (row["score"], -row["odd"]), reverse=True)
+    return {
+        "key": key,
+        "seed_period": period,
+        "salt": salt,
+        "ranking": ranking,
+        "targets": targets,
+        "target_ratios": [f"{odd_n}:{k - odd_n}" for odd_n in targets],
+        "window": window,
+        "components": [{"name": name, "weight": weight} for name, weight, _ranked in components],
+    }
+
+
+def _build_duplex_shapes() -> list[tuple[int, int, int]]:
+    """三区之和为 7、每区 1–4 的复式池结构，含 232、322、223、331 等。"""
+    catalog = []
+    for first in range(1, 5):
+        for second in range(1, 5):
+            third = 7 - first - second
+            if 1 <= third <= 4:
+                catalog.append((first, second, third))
+    return catalog
+
+
+DUPLEX_SHAPES = _build_duplex_shapes()
+
+
+def _shrink_rate(counts: list[int], total: int, prior: float, fair: list[float]) -> list[float]:
+    """贝叶斯收缩频率。prior 是等效期数，fair 是各类别的公平基准。"""
+    denom = total + prior
+    return [(counts[index] + prior * fair[index]) / denom for index in range(len(fair))]
+
+
+def _combine_ranked(components: list[tuple[str, float, list[float]]]) -> list[float]:
+    width = len(components[0][2]) if components else 0
+    scores = [0.0] * width
+    for _name, weight, ranked in components:
+        for index, value in enumerate(ranked):
+            scores[index] += weight * value
+    return scores
+
+
+def _ensemble_category_scores(
+    draws: list[dict],
+    fair: list[float],
+    counts_of: Callable[[int], tuple[list[int], int]],
+    ewma_of: Callable[[], list[float]],
+) -> tuple[list[float], list[tuple[str, float, list[float]]]]:
+    """与奇偶推理相同的多窗口集成：贝叶斯收缩、30 对 120 趋势、ewma50。"""
+    width = len(fair)
+    components: list[tuple[str, float, list[float]]] = []
+    if draws:
+        for bayes_window, prior, weight in _ENSEMBLE_BAYES:
+            counts, total = counts_of(bayes_window)
+            rates = _shrink_rate(counts, total, prior, fair)
+            components.append((f"bayes_{bayes_window or 'all'}", weight, _rank_values(rates)))
+        recent_counts, recent_total = counts_of(30)
+        medium_counts, medium_total = counts_of(120)
+        recent = _shrink_rate(recent_counts, recent_total, 60.0, fair)
+        medium = _shrink_rate(medium_counts, medium_total, 120.0, fair)
+        trend = [recent[index] - medium[index] for index in range(width)]
+        components.append(("dynamic_30_120", _ENSEMBLE_TREND_WEIGHT, _rank_values(trend)))
+        components.append(("ewma50", _ENSEMBLE_EWMA_WEIGHT, _rank_values(ewma_of())))
+    else:
+        for bayes_window, _prior, weight in _ENSEMBLE_BAYES:
+            components.append((f"bayes_{bayes_window or 'all'}", weight, _rank_values(list(fair))))
+        components.append(("dynamic_30_120", _ENSEMBLE_TREND_WEIGHT, _rank_values([0.0] * width)))
+        components.append(("ewma50", _ENSEMBLE_EWMA_WEIGHT, _rank_values([0.0] * width)))
+    return _combine_ranked(components), components
+
+
+def _component_meta(components: list[tuple[str, float, list[float]]]) -> list[dict]:
+    return [{"name": name, "weight": weight} for name, weight, _ranked in components]
+
+
+def _allocate_by_score(
+    labels: list,
+    scores: list[float],
+    ticket_count: int,
+    period: str,
+    salt: str,
+    allowed: set | None = None,
+) -> list:
+    """用最近一期期号做随机种子，按分数加权分配。allowed 给定时只在其中抽取。"""
+    rng = random.Random(f"{period}:{salt}")
+    pairs = list(zip(labels, scores))
+    if allowed is not None:
+        filtered = [(label, score) for label, score in pairs if label in allowed]
+        if filtered:
+            pairs = filtered
+    use_labels = [label for label, _score in pairs]
+    use_scores = [score for _label, score in pairs]
+    picked = _sample_odd_targets(use_scores, max(int(ticket_count), 1), rng)
+    return [use_labels[index] for index in picked]
+
+
+def _parse_shape_key(label: str) -> tuple[int, int, int]:
+    return int(label[0]), int(label[1]), int(label[2])
+
+
+def _parts_key(parts: tuple[int, int, int]) -> str:
+    return f"{int(parts[0])}{int(parts[1])}{int(parts[2])}"
+
+
+def _parts_label(parts: tuple[int, int, int]) -> str:
+    return f"{int(parts[0])}+{int(parts[1])}+{int(parts[2])}"
+
+
+def _iter_valid_fronts(draws: list[dict], window: int):
+    """只产出前区恰好 5 码的开奖，供形态与和值计数。"""
+    for draw in slice_draws(draws, window):
+        front = list(draw.get("front") or [])
+        if len(front) == FRONT_K:
+            yield front
+
+
+def _single_shape_catalog(draws: list[dict]) -> list[str]:
+    """至少覆盖 SINGLE_SHAPES，并纳入历史里出现过、三区之和为 5 的形态。"""
+    found = set(SINGLE_SHAPES)
+    for front in _iter_valid_fronts(draws, 0):
+        parts = zone3(front)
+        if sum(parts) == FRONT_K:
+            found.add(_parts_key(parts))
+    return sorted(found)
+
+
+def _fair_shape_prior(labels: list[str]) -> list[float]:
+    """按三区容量的组合数给单式形态一个公平基准，再在候选形态上归一。"""
+    denom = math.comb(FRONT_N, FRONT_K)
+    raw = []
+    for label in labels:
+        first, second, third = _parse_shape_key(label)
+        if (
+            first + second + third != FRONT_K
+            or first > 12
+            or second > 12
+            or third > 11
+            or min(first, second, third) < 0
+        ):
+            raw.append(0.0)
+            continue
+        raw.append(math.comb(12, first) * math.comb(12, second) * math.comb(11, third) / denom)
+    total = sum(raw)
+    if total <= 0:
+        return [1.0 / max(len(labels), 1)] * len(labels)
+    return [value / total for value in raw]
+
+
+def infer_front_shapes(
+    draws: list[dict],
+    ticket_count: int,
+    window: int = 0,
+    allowed: set[str] | None = None,
+) -> dict:
+    """
+    给前区三区形态打分，并按注分配目标。
+    同一批开奖、同一最近期号，分配不变。allowed 用来避开本期候选组不出的形态。
+    """
+    labels = _single_shape_catalog(draws)
+    fair = _fair_shape_prior(labels)
+    index_of = {label: index for index, label in enumerate(labels)}
+
+    def counts_of(bayes_window: int) -> tuple[list[int], int]:
+        counts = [0] * len(labels)
+        total = 0
+        for front in _iter_valid_fronts(draws, bayes_window):
+            index = index_of.get(_parts_key(zone3(front)))
+            if index is None:
+                continue
+            counts[index] += 1
+            total += 1
+        return counts, total
+
+    def ewma_of() -> list[float]:
+        alpha = 2.0 / 51.0
+        scores = [0.0] * len(labels)
+        for front in _iter_valid_fronts(draws, 0):
+            hit = index_of.get(_parts_key(zone3(front)))
+            for index in range(len(labels)):
+                appeared = 1.0 if index == hit else 0.0
+                scores[index] = alpha * appeared + (1.0 - alpha) * scores[index]
+        return scores
+
+    scores, components = _ensemble_category_scores(draws, fair, counts_of, ewma_of)
+    view_counts = counts_of(window)[0] if draws else [0] * len(labels)
+    period = str(draws[-1].get("period", "")) if draws else ""
+    targets = _allocate_by_score(labels, scores, ticket_count, period, "front-shape", allowed)
+    ranking = [
+        {
+            "shape": label,
+            "parts": list(_parse_shape_key(label)),
+            "label": _parts_label(_parse_shape_key(label)),
+            "score": round(float(scores[index]), 6),
+            "window_count": view_counts[index],
+        }
+        for index, label in enumerate(labels)
+    ]
+    ranking.sort(key=lambda row: (row["score"], row["shape"]), reverse=True)
+    return {
+        "seed_period": period,
+        "salt": "front-shape",
+        "ranking": ranking,
+        "targets": targets,
+        "window": window,
+        "components": _component_meta(components),
+    }
+
+
+def _nearest_duplex(parts: tuple[int, int, int], catalog: list[tuple[int, int, int]]) -> int:
+    """把一期 5 码的三区个数映射到比例最接近的 7 码池结构。"""
+    best_index = 0
+    best_key: tuple[float, int] | None = None
+    for index, (first, second, third) in enumerate(catalog):
+        distance = (
+            abs(first / 7.0 - parts[0] / FRONT_K)
+            + abs(second / 7.0 - parts[1] / FRONT_K)
+            + abs(third / 7.0 - parts[2] / FRONT_K)
+        )
+        key = (distance, index)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_index = index
+    return best_index
+
+
+def _fair_duplex_prior(catalog: list[tuple[int, int, int]]) -> list[float]:
+    ways = [
+        math.comb(12, first) * math.comb(12, second) * math.comb(11, third)
+        for first, second, third in catalog
+    ]
+    total = sum(ways) or 1
+    return [value / total for value in ways]
+
+
+def infer_duplex_shape(draws: list[dict], window: int = 0) -> dict:
+    """推理一个本期共享的 7 码复式池结构。池不按注拆开，只抽一次。"""
+    catalog = DUPLEX_SHAPES
+    fair = _fair_duplex_prior(catalog)
+
+    def counts_of(bayes_window: int) -> tuple[list[int], int]:
+        counts = [0] * len(catalog)
+        total = 0
+        for front in _iter_valid_fronts(draws, bayes_window):
+            counts[_nearest_duplex(zone3(front), catalog)] += 1
+            total += 1
+        return counts, total
+
+    def ewma_of() -> list[float]:
+        alpha = 2.0 / 51.0
+        scores = [0.0] * len(catalog)
+        for front in _iter_valid_fronts(draws, 0):
+            hit = _nearest_duplex(zone3(front), catalog)
+            for index in range(len(catalog)):
+                appeared = 1.0 if index == hit else 0.0
+                scores[index] = alpha * appeared + (1.0 - alpha) * scores[index]
+        return scores
+
+    scores, components = _ensemble_category_scores(draws, fair, counts_of, ewma_of)
+    view_counts = counts_of(window)[0] if draws else [0] * len(catalog)
+    period = str(draws[-1].get("period", "")) if draws else ""
+    labels = [_parts_key(parts) for parts in catalog]
+    chosen = _allocate_by_score(labels, scores, 1, period, "duplex-pool")[0]
+    chosen_index = labels.index(chosen)
+    parts = catalog[chosen_index]
+    ranking = [
+        {
+            "shape": labels[index],
+            "label": _parts_label(catalog[index]),
+            "parts": list(catalog[index]),
+            "score": round(float(scores[index]), 6),
+            "window_count": view_counts[index],
+        }
+        for index in range(len(catalog))
+    ]
+    ranking.sort(key=lambda row: (row["score"], row["shape"]), reverse=True)
+    return {
+        "seed_period": period,
+        "salt": "duplex-pool",
+        "shape": chosen,
+        "label": _parts_label(parts),
+        "parts": list(parts),
+        "score": round(float(scores[chosen_index]), 6),
+        "ranking": ranking,
+        "window": window,
+        "components": _component_meta(components),
+    }
+
+
+def _sum_bin_count() -> int:
+    return (_SUM_MAX - _SUM_MIN) // _SUM_BIN + 1
+
+
+def _sum_to_bin(total: int) -> int:
+    bounded = min(_SUM_MAX, max(_SUM_MIN, int(total)))
+    return (bounded - _SUM_MIN) // _SUM_BIN
+
+
+def _bin_center(index: int) -> int:
+    low = _SUM_MIN + index * _SUM_BIN
+    high = min(_SUM_MAX, low + _SUM_BIN - 1)
+    return (low + high) // 2
+
+
+_FAIR_SUM_BINS: list[float] | None = None
+
+
+def _fair_sum_bins() -> list[float]:
+    """5 个不重复前区号码之和的分箱公平基准，体现和值自然波动。"""
+    global _FAIR_SUM_BINS
+    if _FAIR_SUM_BINS is not None:
+        return list(_FAIR_SUM_BINS)
+    width = _sum_bin_count()
+    ways = [0] * width
+    table = [[0] * (_SUM_MAX + 1) for _ in range(FRONT_K + 1)]
+    table[0][0] = 1
+    for number in range(1, FRONT_N + 1):
+        for taken in range(FRONT_K, 0, -1):
+            for total in range(_SUM_MAX, number - 1, -1):
+                table[taken][total] += table[taken - 1][total - number]
+    for total in range(_SUM_MIN, _SUM_MAX + 1):
+        ways[_sum_to_bin(total)] += table[FRONT_K][total]
+    denom = sum(ways) or 1
+    _FAIR_SUM_BINS = [count / denom for count in ways]
+    return list(_FAIR_SUM_BINS)
+
+
+def infer_front_sums(draws: list[dict], ticket_count: int, window: int = 0) -> dict:
+    """按历史前区和值分布给每注一个目标和值。近窗均值和波动体现在多窗口频率里。"""
+    fair = _fair_sum_bins()
+    width = len(fair)
+    centers = [_bin_center(index) for index in range(width)]
+
+    def counts_of(bayes_window: int) -> tuple[list[int], int]:
+        counts = [0] * width
+        total = 0
+        for front in _iter_valid_fronts(draws, bayes_window):
+            counts[_sum_to_bin(sum(front))] += 1
+            total += 1
+        return counts, total
+
+    def ewma_of() -> list[float]:
+        alpha = 2.0 / 51.0
+        scores = [0.0] * width
+        for front in _iter_valid_fronts(draws, 0):
+            hit = _sum_to_bin(sum(front))
+            for index in range(width):
+                appeared = 1.0 if index == hit else 0.0
+                scores[index] = alpha * appeared + (1.0 - alpha) * scores[index]
+        return scores
+
+    scores, components = _ensemble_category_scores(draws, fair, counts_of, ewma_of)
+    view_counts = counts_of(window)[0] if draws else [0] * width
+    period = str(draws[-1].get("period", "")) if draws else ""
+    targets = _allocate_by_score(centers, scores, ticket_count, period, "front-sum")
+    ranking = [
+        {
+            "sum": centers[index],
+            "score": round(float(scores[index]), 6),
+            "window_count": view_counts[index],
+        }
+        for index in range(width)
+    ]
+    ranking.sort(key=lambda row: (row["score"], -row["sum"]), reverse=True)
+    return {
+        "seed_period": period,
+        "salt": "front-sum",
+        "ranking": ranking,
+        "targets": [int(value) for value in targets],
+        "window": window,
+        "bin_width": _SUM_BIN,
+        "components": _component_meta(components),
     }
 
 
@@ -241,14 +761,19 @@ def ranked_in_zone(scores: list[float], zone_nums: list[int], k: int) -> list[in
     return cands[: max(0, k)]
 
 
-def duplex_232_pool(front_scores: list[float], exclude: list[int]) -> list[int]:
-    """232 复式关注池：三区各取 2/3/2，共 7 码。"""
+def duplex_232_pool(
+    front_scores: list[float],
+    exclude: list[int],
+    shape: tuple[int, int, int] | None = None,
+) -> list[int]:
+    """7 码复式关注池。未传入结构时仍按 232；传入时按推理出的三区个数取号。"""
+    quota = shape or DUPLEX_232
     eligible = eligible_nums(FRONT_N, exclude)
     z1, z2, z3 = split_zones(eligible)
     picks = (
-        ranked_in_zone(front_scores, z1, DUPLEX_232[0])
-        + ranked_in_zone(front_scores, z2, DUPLEX_232[1])
-        + ranked_in_zone(front_scores, z3, DUPLEX_232[2])
+        ranked_in_zone(front_scores, z1, quota[0])
+        + ranked_in_zone(front_scores, z2, quota[1])
+        + ranked_in_zone(front_scores, z3, quota[2])
     )
     return sorted(picks)
 
@@ -265,6 +790,96 @@ def _focus_count(nums: list[int], focus: list[int]) -> int:
     return len(set(nums) & set(focus))
 
 
+def _quota_fronts_by_sum(scored: list[tuple], sum_targets: list[int], limit: int) -> list[list[int]]:
+    """每个目标和值留一批最接近的组合，其余再按原排序补足。"""
+    picked: list[list[int]] = []
+    seen = set()
+    per_target = 12
+    for target in sum_targets:
+        taken = 0
+        nearest = sorted(
+            scored,
+            key=lambda row: (abs(sum(row[3]) - int(target)), -row[0], -row[1], -row[2]),
+        )
+        for row in nearest:
+            front = row[3]
+            key = tuple(front)
+            if key in seen:
+                continue
+            distance = abs(sum(front) - int(target))
+            if taken > 0 and distance > _SUM_BIN * 2:
+                break
+            seen.add(key)
+            picked.append(list(front))
+            taken += 1
+            if taken >= per_target:
+                break
+    cap = max(limit, per_target * max(len(set(sum_targets)), 1))
+    for row in scored:
+        front = row[3]
+        key = tuple(front)
+        if key in seen:
+            continue
+        seen.add(key)
+        picked.append(list(front))
+        if len(picked) >= cap:
+            break
+    return picked
+
+
+def _zone_sources(
+    scores: list[float],
+    zones: tuple[list[int], list[int], list[int]],
+    shapes: list[tuple[int, int, int]],
+) -> tuple[list[int], list[int], list[int]]:
+    """按要覆盖的形态准备各区候选号，避免只够拼出一种形态。"""
+    need = [0, 0, 0]
+    for shape in shapes:
+        for index in range(3):
+            need[index] = max(need[index], int(shape[index]))
+    sources = []
+    for index in range(3):
+        width = min(len(zones[index]), max(need[index] + 1, 4))
+        sources.append(ranked_in_zone(scores, zones[index], width))
+    return sources[0], sources[1], sources[2]
+
+
+def _enumerate_many_shapes(
+    z1: list[int],
+    z2: list[int],
+    z3: list[int],
+    shapes: list[tuple[int, int, int]],
+    odd_n: int,
+    focus: list[int],
+    stats: dict,
+    back_ref: list[int],
+    sum_targets: list[int] | None,
+) -> list[list[int]]:
+    """推理模式下把多个三区形态的组合并到同一候选池。"""
+    merged: list[list[int]] = []
+    seen = set()
+    for shape in shapes:
+        part = _enumerate_fronts(
+            z1,
+            z2,
+            z3,
+            shape,
+            odd_n,
+            focus,
+            stats,
+            back_ref,
+            limit=24,
+            sum_targets=sum_targets,
+        )
+        for front in part:
+            key = tuple(front)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(front)
+    return merged
+
+
 def _enumerate_fronts(
     z1: list[int],
     z2: list[int],
@@ -277,6 +892,7 @@ def _enumerate_fronts(
     limit: int = 80,
     sum_lo: int | None = None,
     sum_hi: int | None = None,
+    sum_targets: list[int] | None = None,
 ) -> list[list[int]]:
     """按三区个数枚举前区 5 码，再按和值区间、关注数与形态分排序。"""
     a, b, c = shape
@@ -297,6 +913,9 @@ def _enumerate_fronts(
                 q = combo_quality(front, back_ref, stats)
                 scored.append((in_band, fc, q, front))
     scored.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+    if sum_targets:
+        # 每个目标和值都留一批接近的组合，避免 80 个高分组合全挤在同一个和值附近。
+        return _quota_fronts_by_sum(scored, sum_targets, limit)
     uniq = []
     seen = set()
     for _band, fc, q, front in scored:
@@ -319,6 +938,7 @@ def _pick_backs(
     pair_residuals: dict[tuple[int, int], float] | None = None,
     popularity_scorer: Callable[[list[int]], float] | None = None,
     popularity_weight: float = 0.0,
+    odd_targets: list[int] | None = None,
 ) -> list[list[int]]:
     """后区 2 码组合优化：模型分、轻量关系分和五注号码覆盖分开考虑。"""
     eligible = [i for i in eligible_nums(BACK_N, exclude) if back_scores[i] != float("-inf")]
@@ -367,14 +987,18 @@ def _pick_backs(
     out = []
     used: Counter = Counter()
     while scored and len(out) < count:
-        best = max(
-            scored,
-            key=lambda row: (
-                row[0] + 0.65 * sum(used[n] == 0 for n in row[2]) - 0.30 * sum(used[n] for n in row[2]),
+        target_odd = odd_targets[len(out)] if odd_targets is not None and len(out) < len(odd_targets) else None
+
+        def _back_key(row, target_odd=target_odd):
+            # 推理模式下按该注目标奇偶加分；没有对应组合时退回覆盖最优。
+            bonus = _OE_TARGET_BONUS if target_odd is not None and odd_even(row[2])[0] == target_odd else 0.0
+            return (
+                row[0] + bonus + 0.65 * sum(used[n] == 0 for n in row[2]) - 0.30 * sum(used[n] for n in row[2]),
                 row[1],
                 tuple(-n for n in row[2]),
-            ),
-        )
+            )
+
+        best = max(scored, key=_back_key)
         out.append(best[2])
         used.update(best[2])
         scored.remove(best)
@@ -391,7 +1015,10 @@ def _select_diverse_fronts(
     tier_scores: list[float] | None = None,
     popularity_scorer: Callable[[list[int]], float] | None = None,
     popularity_weight: float = 0.0,
-) -> list[tuple[list[int], str, float, float]]:
+    odd_targets: list[int] | None = None,
+    shape_targets: list[str] | None = None,
+    sum_targets: list[int] | None = None,
+) -> list[tuple[list[int], str, float, float] | None]:
     """优先覆盖尚未覆盖的三元组，避免推荐列表只是同一注换一个号码。"""
     unique = []
     seen = set()
@@ -421,8 +1048,23 @@ def _select_diverse_fronts(
     selected: list[list[int]] = []
     covered_triples: set[tuple[int, int, int]] = set()
     usage: Counter = Counter()
-    result = []
-    for index in range(count):
+    # 少数派目标先选。反锁死放在最后一注，若留到最后才选，容易被覆盖约束挤掉。
+    pick_order = list(range(count))
+    odd_tally = Counter(odd_targets or [])
+    shape_tally = Counter(shape_targets or [])
+    sum_tally = Counter(sum_targets or [])
+
+    def _rarity(index: int) -> tuple:
+        # 少数派目标先选，避免留到最后被覆盖约束挤掉。
+        odd_rank = odd_tally[odd_targets[index]] if odd_targets and index < len(odd_targets) else 0
+        shape_rank = shape_tally[shape_targets[index]] if shape_targets and index < len(shape_targets) else 0
+        sum_rank = sum_tally[sum_targets[index]] if sum_targets and index < len(sum_targets) else 0
+        return (shape_rank, odd_rank, sum_rank, -index)
+
+    if odd_targets or shape_targets or sum_targets:
+        pick_order.sort(key=_rarity)
+    slots: list = [None] * count
+    for index in pick_order:
         experimental = count >= 5 and index >= count - 2
         best = None
         for front in unique:
@@ -447,9 +1089,22 @@ def _select_diverse_fronts(
             utility += 0.16 * sum(usage[number] == 0 for number in front)
             # 人气层只在开奖评分接近时轻量择优，不把低人气解释成更易开奖。
             utility -= popularity_weight * crowd_penalty
-            if preferred_shape is not None and zone3(front) == preferred_shape:
+            if shape_targets is not None and index < len(shape_targets):
+                if zone3_label(front) == shape_targets[index]:
+                    utility += _OE_TARGET_BONUS
+            elif preferred_shape is not None and zone3(front) == preferred_shape:
                 utility += 0.24
-            if preferred_odd < 0 or odd_even(front)[0] == preferred_odd:
+            if sum_targets is not None and index < len(sum_targets):
+                distance = abs(sum(front) - int(sum_targets[index]))
+                if distance <= _SUM_MATCH:
+                    utility += _SUM_TARGET_BONUS
+                else:
+                    utility += _SUM_TARGET_BONUS * max(0.0, 1.0 - (distance - _SUM_MATCH) / (_SUM_BIN * 3))
+            target_odd = odd_targets[index] if odd_targets is not None and index < len(odd_targets) else None
+            if target_odd is not None:
+                if odd_even(front)[0] == target_odd:
+                    utility += _OE_TARGET_BONUS
+            elif preferred_odd < 0 or odd_even(front)[0] == preferred_odd:
                 utility += 0.12
             if experimental:
                 # 重点检验 3高+1低+1极冷；这是实验结构，不是假定有效的规律。
@@ -464,7 +1119,26 @@ def _select_diverse_fronts(
             remaining = [front for front in unique if front not in selected]
             if not remaining:
                 break
-            front = remaining[0]
+            target_odd = odd_targets[index] if odd_targets is not None and index < len(odd_targets) else None
+            target_shape = shape_targets[index] if shape_targets is not None and index < len(shape_targets) else None
+            target_sum = sum_targets[index] if sum_targets is not None and index < len(sum_targets) else None
+            pool = remaining
+            if target_shape is not None:
+                matched = [front for front in pool if zone3_label(front) == target_shape]
+                if matched:
+                    pool = matched
+            if target_sum is not None:
+                matched = [front for front in pool if abs(sum(front) - int(target_sum)) <= _SUM_MATCH]
+                if matched:
+                    pool = matched
+            if target_odd is not None:
+                matched = [front for front in pool if odd_even(front)[0] == target_odd]
+                if matched:
+                    pool = matched
+            front = max(
+                pool,
+                key=lambda item: (sum(scores[number] for number in item), tuple(-number for number in item)),
+            )
             popularity = popularity_by_front.get(
                 tuple(front), popularity_scorer(front) if popularity_scorer else _popularity_proxy(front)
             )
@@ -486,8 +1160,28 @@ def _select_diverse_fronts(
             role = "覆盖优化（冷门池不足）"
         else:
             role = "覆盖优化"
-        result.append((front, role, model_score, popularity))
-    return result
+        slots[index] = (front, role, model_score, popularity)
+    return slots
+
+
+def _mark_odd_shortfall(
+    relaxed: list[str],
+    tickets: list[dict],
+    targets: list[int] | None,
+    area: str,
+    key: str,
+) -> None:
+    """目标奇偶在候选里凑不满时记一笔，票仍然照出。"""
+    if not targets:
+        return
+    for index, ticket in enumerate(tickets):
+        if index >= len(targets):
+            break
+        if odd_even(ticket[key])[0] != targets[index]:
+            text = f"{area}奇偶推理（未凑满，已回退）"
+            if text not in relaxed:
+                relaxed.append(text)
+            return
 
 
 def generate_recommendations(
@@ -495,7 +1189,7 @@ def generate_recommendations(
     marks: dict,
     window: int = 100,
     mode: str = "ensemble",
-    shape_key: str = "221",
+    shape_key: str = SHAPE_INFER,
     use_duplex_232: bool = True,
     front_odd: int = 3,
     back_odd: int = 1,
@@ -507,7 +1201,10 @@ def generate_recommendations(
 ) -> dict:
     """
     生成关注池与 3～5 注单式。
-    front_odd / back_odd 为奇数个数；负数表示不约束。
+    front_odd / back_odd：-2 历史推理，-1 不限，>=0 为奇数个数硬约束。
+    shape_key：infer 为历史推理；其它键为手动单式形态。
+    use_duplex_232 为真时使用 7 码复式池，区个数按历史推理，不再写死 232。
+    constrain_sum 为真时按历史和值给每注一个目标，不再把五注卡在同一个均值±σ。
     """
     use = slice_draws(draws, window)
     stats = pattern_stats(use if len(use) >= 30 else draws)
@@ -533,9 +1230,6 @@ def generate_recommendations(
             "error": "排除号过多，前区可选票不足 5 个",
         }
     z1, z2, z3 = split_zones(eligible_f)
-    duplex = duplex_232_pool(fs, front_excl)
-
-    shape = SINGLE_SHAPES.get(shape_key, SINGLE_SHAPES["221"])
     back_ref = sorted(
         (i for i in range(1, BACK_N + 1) if bs[i] != float("-inf")),
         key=lambda n: (bs[n], -n),
@@ -546,72 +1240,97 @@ def generate_recommendations(
     front_popularity_scorer = (
         (lambda front: crowd_model.score(front, back_ref, draws)) if crowd_model else None
     )
+    # 均值±σ只作为结果里的历史参照，勾选和值时不再用它硬卡全部注。
     sum_lo, sum_hi, sum_mean = sum_band(stats, 1.0)
-    enum_lo, enum_hi = (sum_lo, sum_hi) if constrain_sum else (None, None)
 
     front_dans = pick_dans(fs, FRONT_N, front_excl, front_focus, 1, 2, 2)
     back_dans = pick_dans(bs, BACK_N, back_excl, back_focus, 1, 1, 1)
 
-    if use_duplex_232 and len(duplex) >= FRONT_K:
-        src1, src2, src3 = split_zones(duplex)
-        # 复式池不足目标形态时，用池内实际可组形态兜底
-        fronts = _enumerate_fronts(
-            src1, src2, src3, shape, front_odd, front_focus, stats, back_ref,
-            sum_lo=enum_lo, sum_hi=enum_hi,
-        )
-        constraints_relaxed = []
-        if len(fronts) < ticket_count:
-            constraints_relaxed.append("前区奇偶")
-            fronts = _enumerate_fronts(
-                src1, src2, src3, shape, -1, front_focus, stats, back_ref,
-                sum_lo=enum_lo, sum_hi=enum_hi,
-            )
-        # 232 池内始终纳入全部 5 码子集；选定形态作为偏好而非硬锁，避免某一区两码绑死五注。
-        extra = [sorted(cand) for cand in combinations(sorted(duplex), FRONT_K)]
-        extra.sort(
-            key=lambda f: (_focus_count(f, front_focus), combo_quality(f, back_ref, stats)),
-            reverse=True,
-        )
-        seen = {tuple(x) for x in fronts}
-        for f in extra:
-            if tuple(f) in seen:
-                continue
-            fronts.append(f)
-            seen.add(tuple(f))
-        pool_note = "232复式池"
-        front_pool = duplex
+    n = min(max(ticket_count, 3), 5)
+    front_infer = infer_odd_even(draws, "front", n, window) if front_odd == ODD_EVEN_INFER else None
+    back_infer = infer_odd_even(draws, "back", n, window) if back_odd == ODD_EVEN_INFER else None
+    front_targets = list(front_infer["targets"]) if front_infer else None
+    back_targets = list(back_infer["targets"]) if back_infer else None
+    # 推理和不限都不按单一奇偶硬过滤；只有 >=0 才是硬约束。
+    enum_front_odd = front_odd if front_odd >= 0 else ODD_EVEN_ANY
+    enum_back_odd = back_odd if back_odd >= 0 else ODD_EVEN_ANY
+    if shape_key != SHAPE_INFER and shape_key not in SINGLE_SHAPES:
+        shape_key = "221"
+    manual_shape = None if shape_key == SHAPE_INFER else SINGLE_SHAPES[shape_key]
+    sum_infer = infer_front_sums(draws, n, window) if constrain_sum else None
+    sum_targets = list(sum_infer["targets"]) if sum_infer else None
+
+    constraints_relaxed: list[str] = []
+    duplex_infer = infer_duplex_shape(draws, window) if use_duplex_232 else None
+    duplex_parts = tuple(duplex_infer["parts"]) if duplex_infer else None
+    duplex = duplex_232_pool(fs, front_excl, duplex_parts) if duplex_parts else []
+    if use_duplex_232 and len(duplex) >= FRONT_K and duplex_infer is not None:
+        # 池内全部 5 码子集都可入选；形态只作偏好，避免某一区个数把五注绑死。
+        fronts = [sorted(cand) for cand in combinations(sorted(duplex), FRONT_K)]
+        actual_parts = zone3(duplex)
+        duplex_infer["actual_parts"] = list(actual_parts)
+        duplex_infer["actual_shape"] = _parts_key(actual_parts)
+        duplex_infer["actual_label"] = _parts_label(actual_parts)
+        if actual_parts != duplex_parts:
+            constraints_relaxed.append("复式池分区（未凑满，已回退）")
+        pool_note = f"复式池{duplex_infer['actual_label']}"
+        front_pool = list(duplex)
     else:
-        constraints_relaxed = []
-        # 单式形态：各区多取几个高分号再组合
-        src1 = ranked_in_zone(fs, z1, max(shape[0] + 3, 4))
-        src2 = ranked_in_zone(fs, z2, max(shape[1] + 3, 4))
-        src3 = ranked_in_zone(fs, z3, max(shape[2] + 3, 4))
-        fronts = _enumerate_fronts(
-            src1, src2, src3, shape, front_odd, front_focus, stats, back_ref,
-            sum_lo=enum_lo, sum_hi=enum_hi,
-        )
-        if len(fronts) < ticket_count:
-            constraints_relaxed.append("前区奇偶")
-            fronts = _enumerate_fronts(
-                src1, src2, src3, shape, -1, front_focus, stats, back_ref,
-                sum_lo=enum_lo, sum_hi=enum_hi,
+        if use_duplex_232:
+            duplex_infer = None
+            duplex = []
+        if manual_shape is None:
+            catalog = _single_shape_catalog(draws)
+            shape_tuples = [_parse_shape_key(label) for label in catalog]
+            src1, src2, src3 = _zone_sources(fs, (z1, z2, z3), shape_tuples)
+            fronts = _enumerate_many_shapes(
+                src1, src2, src3, shape_tuples, enum_front_odd, front_focus, stats, back_ref, sum_targets,
             )
-        pool_note = f"单式形态{shape_key}"
+            if front_odd >= 0 and len(fronts) < n:
+                constraints_relaxed.append("前区奇偶")
+                fronts = _enumerate_many_shapes(
+                    src1, src2, src3, shape_tuples, ODD_EVEN_ANY, front_focus, stats, back_ref, sum_targets,
+                )
+            pool_note = "形态历史推理"
+        else:
+            src1 = ranked_in_zone(fs, z1, max(manual_shape[0] + 3, 4))
+            src2 = ranked_in_zone(fs, z2, max(manual_shape[1] + 3, 4))
+            src3 = ranked_in_zone(fs, z3, max(manual_shape[2] + 3, 4))
+            fronts = _enumerate_fronts(
+                src1, src2, src3, manual_shape, enum_front_odd, front_focus, stats, back_ref,
+                sum_targets=sum_targets,
+            )
+            if front_odd >= 0 and len(fronts) < n:
+                constraints_relaxed.append("前区奇偶")
+                fronts = _enumerate_fronts(
+                    src1, src2, src3, manual_shape, ODD_EVEN_ANY, front_focus, stats, back_ref,
+                    sum_targets=sum_targets,
+                )
+            pool_note = f"单式形态{shape_key}"
         front_pool = sorted(set(src1 + src2 + src3))
+
+    shape_infer = None
+    shape_targets = None
+    if manual_shape is None:
+        allowed = {zone3_label(front) for front in fronts}
+        shape_infer = infer_front_shapes(draws, n, window, allowed)
+        shape_targets = list(shape_infer["targets"])
 
     front_pairs = _pair_residuals(draws, "front", FRONT_N)
     back_pairs = _pair_residuals(draws, "back", BACK_N)
-    n = min(max(ticket_count, 3), 5)
     selected_fronts = _select_diverse_fronts(
         fronts,
         fs,
         n,
         front_pairs,
-        shape,
-        front_odd,
+        manual_shape,
+        enum_front_odd,
         tier_scores=raw_fs,
         popularity_scorer=front_popularity_scorer,
         popularity_weight=effective_crowd_weight,
+        odd_targets=front_targets,
+        shape_targets=shape_targets,
+        sum_targets=sum_targets,
     )
     front_anchor = sorted(eligible_f, key=lambda number: (fs[number], -number), reverse=True)[:5]
     back_popularity_scorer = (
@@ -621,11 +1340,12 @@ def generate_recommendations(
         bs,
         back_excl,
         back_focus,
-        back_odd,
+        enum_back_odd,
         n,
         back_pairs,
         back_popularity_scorer,
         effective_crowd_weight,
+        odd_targets=back_targets,
     )
     if not backs:
         backs = [[1, 2]]
@@ -645,8 +1365,9 @@ def generate_recommendations(
     low_tier = set(tier_order[10:25])
     cold_tier = set(tier_order[25:])
     for i in range(n):
-        if i < len(selected_fronts):
-            front, role, draw_score, popularity = selected_fronts[i]
+        chosen = selected_fronts[i] if i < len(selected_fronts) else None
+        if chosen is not None:
+            front, role, draw_score, popularity = chosen
         else:
             front = fronts[i] if i < len(fronts) else (fronts[0] if fronts else sorted(eligible_f[:5]))
             role, draw_score, popularity = "覆盖优化", sum(fs[number] for number in front), _popularity_proxy(front)
@@ -664,6 +1385,8 @@ def generate_recommendations(
                 "front": list(front),
                 "back": list(back),
                 "shape": zone3_label(front),
+                "target_shape": shape_targets[i] if shape_targets and i < len(shape_targets) else "",
+                "target_sum": int(sum_targets[i]) if sum_targets and i < len(sum_targets) else None,
                 "odd_even": f"{odd_even(front)[0]}:{odd_even(front)[1]}",
                 "back_oe": f"{odd_even(back)[0]}:{odd_even(back)[1]}",
                 "front_sum": fsum,
@@ -703,11 +1426,25 @@ def generate_recommendations(
             ticket["crowd_level"] = "启发式"
             ticket["crowd_basis"] = "号码形态代理"
 
-    if any(zone3(ticket["front"]) != shape for ticket in tickets):
+    if manual_shape is not None and any(zone3(ticket["front"]) != manual_shape for ticket in tickets):
         constraints_relaxed.append("部分单式形态（用于减少五注绑号）")
+    if shape_targets and any(
+        zone3_label(ticket["front"]) != shape_targets[index]
+        for index, ticket in enumerate(tickets)
+        if index < len(shape_targets)
+    ):
+        constraints_relaxed.append("前区形态推理（未凑满，已回退）")
+    if sum_targets and any(
+        abs(int(ticket["front_sum"]) - int(sum_targets[index])) > _SUM_MATCH
+        for index, ticket in enumerate(tickets)
+        if index < len(sum_targets)
+    ):
+        constraints_relaxed.append("前区和值推理（未凑满，已回退）")
     if front_odd >= 0 and any(odd_even(ticket["front"])[0] != front_odd for ticket in tickets):
         if "前区奇偶" not in constraints_relaxed:
             constraints_relaxed.append("前区奇偶")
+    _mark_odd_shortfall(constraints_relaxed, tickets, front_targets, "前区", "front")
+    _mark_odd_shortfall(constraints_relaxed, tickets, back_targets, "后区", "back")
 
     front_reference = (
         walk_forward_reference(draws, "front", FRONT_N, len(front_pool))
@@ -734,11 +1471,22 @@ def generate_recommendations(
         "window": window,
         "mode": mode,
         "shape_key": shape_key,
+        "shape_plan": list(shape_infer["targets"]) if shape_infer else [],
+        "shape_infer": shape_infer,
         "use_duplex_232": use_duplex_232,
+        "duplex_shape": (duplex_infer or {}).get("actual_shape") or (duplex_infer or {}).get("shape") or "",
+        "duplex_label": (duplex_infer or {}).get("actual_label") or (duplex_infer or {}).get("label") or "",
+        "duplex_infer": duplex_infer,
         "front_odd": front_odd,
         "back_odd": back_odd,
+        "front_odd_plan": list(front_infer["target_ratios"]) if front_infer else [],
+        "back_odd_plan": list(back_infer["target_ratios"]) if back_infer else [],
+        "front_odd_infer": front_infer,
+        "back_odd_infer": back_infer,
         "ticket_count": n,
         "constrain_sum": constrain_sum,
+        "sum_plan": list(sum_infer["targets"]) if sum_infer else [],
+        "sum_infer": sum_infer,
         "sum_lo": sum_lo,
         "sum_hi": sum_hi,
         "model_version": MODEL_VERSION if mode == "ensemble" else "legacy",

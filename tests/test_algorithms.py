@@ -3,13 +3,16 @@ import math
 import unittest
 
 from services.algorithms import (
+    ODD_EVEN_ANY,
+    ODD_EVEN_INFER,
+    SHAPE_INFER,
     _select_diverse_fronts,
     compare_tickets,
     comparison_summary,
     ensemble_score_vector,
     generate_recommendations,
 )
-from services.stats import fair_pool_coverage, prize_grade
+from services.stats import fair_pool_coverage, odd_even, prize_grade
 
 
 class PrizeTests(unittest.TestCase):
@@ -109,6 +112,170 @@ class ModelTests(unittest.TestCase):
                 ticket["tier_pattern"],
                 [len(front & high), len(front & low), len(front & cold)],
             )
+
+
+class OddEvenInferenceTests(unittest.TestCase):
+    @staticmethod
+    def _marks() -> dict:
+        return {"front": {"focus": [], "exclude": []}, "back": {"focus": [], "exclude": []}}
+
+    def test_same_draws_reproduce_inference(self):
+        draws = ModelTests.sample_draws(100)
+        kwargs = dict(
+            front_odd=ODD_EVEN_INFER,
+            back_odd=ODD_EVEN_INFER,
+            constrain_sum=False,
+            include_reference=False,
+            ticket_count=5,
+        )
+        first = generate_recommendations(draws, self._marks(), **kwargs)
+        second = generate_recommendations(draws, self._marks(), **kwargs)
+        self.assertEqual(
+            [(ticket["front"], ticket["back"]) for ticket in first["tickets"]],
+            [(ticket["front"], ticket["back"]) for ticket in second["tickets"]],
+        )
+        self.assertEqual(first["params"]["front_odd_plan"], second["params"]["front_odd_plan"])
+        self.assertEqual(first["params"]["back_odd_plan"], second["params"]["back_odd_plan"])
+        self.assertEqual(len(first["params"]["front_odd_plan"]), 5)
+        self.assertEqual(len(first["params"]["back_odd_plan"]), 5)
+        self.assertTrue(first["params"]["front_odd_infer"]["ranking"])
+        self.assertEqual(first["params"]["front_odd_infer"]["seed_period"], draws[-1]["period"])
+
+    def test_inferred_tickets_are_not_locked_to_one_ratio(self):
+        result = generate_recommendations(
+            ModelTests.sample_draws(120),
+            self._marks(),
+            front_odd=ODD_EVEN_INFER,
+            back_odd=ODD_EVEN_INFER,
+            constrain_sum=False,
+            include_reference=False,
+            ticket_count=5,
+        )
+        front_ratios = [ticket["odd_even"] for ticket in result["tickets"]]
+        back_ratios = [ticket["back_oe"] for ticket in result["tickets"]]
+        self.assertGreater(len(set(front_ratios)), 1)
+        self.assertGreater(len(set(back_ratios)), 1)
+
+    def test_manual_front_odd_three_stays_constrained(self):
+        result = generate_recommendations(
+            ModelTests.sample_draws(80),
+            self._marks(),
+            front_odd=3,
+            back_odd=1,
+            constrain_sum=False,
+            use_duplex_232=False,
+            include_reference=False,
+            ticket_count=5,
+        )
+        self.assertNotIn("前区奇偶", result["params"]["constraints_relaxed"])
+        self.assertGreaterEqual(len(result["tickets"]), 5)
+        for ticket in result["tickets"]:
+            self.assertEqual(odd_even(ticket["front"])[0], 3)
+            self.assertEqual(ticket["odd_even"], "3:2")
+
+
+class ShapeSumDuplexInferenceTests(unittest.TestCase):
+    @staticmethod
+    def _marks() -> dict:
+        return {"front": {"focus": [], "exclude": []}, "back": {"focus": [], "exclude": []}}
+
+    @staticmethod
+    def varied_draws(count: int = 160) -> list[dict]:
+        """轮换多种三区之和为 5 的形态，让形态得分接近，避免五注被样本锁成同一个。"""
+        shapes = [
+            (2, 2, 1), (2, 1, 2), (1, 2, 2), (1, 3, 1),
+            (1, 1, 3), (3, 1, 1), (3, 2, 0), (2, 3, 0),
+            (4, 1, 0), (0, 2, 3), (2, 0, 3), (1, 4, 0),
+        ]
+        draws = []
+        for index in range(count):
+            first, second, third = shapes[index % len(shapes)]
+            front = [(index + offset) % 12 + 1 for offset in range(first)]
+            front += [(index + offset) % 12 + 13 for offset in range(second)]
+            front += [(index + offset) % 11 + 25 for offset in range(third)]
+            back_a = index % 12 + 1
+            back_b = (index + 5) % 12 + 1
+            if back_a == back_b:
+                back_b = back_b % 12 + 1
+            draws.append(
+                {
+                    "period": str(20000 + index),
+                    "date": "2026-01-01",
+                    "front": sorted(front),
+                    "back": sorted((back_a, back_b)),
+                }
+            )
+        return draws
+
+    def test_same_draws_reproduce_shape_pool_and_sum(self):
+        draws = self.varied_draws()
+        kwargs = dict(
+            shape_key=SHAPE_INFER,
+            use_duplex_232=True,
+            constrain_sum=True,
+            front_odd=ODD_EVEN_INFER,
+            back_odd=ODD_EVEN_INFER,
+            include_reference=False,
+            ticket_count=5,
+        )
+        first = generate_recommendations(draws, self._marks(), **kwargs)
+        second = generate_recommendations(draws, self._marks(), **kwargs)
+        self.assertEqual(
+            [(ticket["front"], ticket["back"]) for ticket in first["tickets"]],
+            [(ticket["front"], ticket["back"]) for ticket in second["tickets"]],
+        )
+        params = first["params"]
+        self.assertEqual(params["shape_plan"], second["params"]["shape_plan"])
+        self.assertEqual(params["sum_plan"], second["params"]["sum_plan"])
+        self.assertEqual(params["duplex_shape"], second["params"]["duplex_shape"])
+        self.assertEqual(params["shape_infer"]["seed_period"], draws[-1]["period"])
+        self.assertEqual(len(params["shape_plan"]), 5)
+        self.assertEqual(len(params["sum_plan"]), 5)
+        parts = params["duplex_infer"]["parts"]
+        self.assertEqual(sum(parts), 7)
+        self.assertTrue(all(1 <= value <= 4 for value in parts))
+        self.assertIn("+", params["duplex_label"])
+        self.assertGreater(len(set(params["sum_plan"])), 1)
+        self.assertTrue(params["shape_infer"]["ranking"])
+        self.assertTrue(params["sum_infer"]["ranking"])
+
+    def test_inferred_ticket_shapes_are_not_all_the_same(self):
+        result = generate_recommendations(
+            self.varied_draws(),
+            self._marks(),
+            shape_key=SHAPE_INFER,
+            use_duplex_232=True,
+            constrain_sum=True,
+            front_odd=ODD_EVEN_INFER,
+            back_odd=ODD_EVEN_INFER,
+            include_reference=False,
+            ticket_count=5,
+        )
+        shapes = [ticket["shape"] for ticket in result["tickets"]]
+        self.assertEqual(len(result["tickets"]), 5)
+        self.assertGreater(len(set(result["params"]["shape_plan"])), 1)
+        self.assertGreater(len(set(shapes)), 1)
+
+    def test_manual_221_without_duplex_stays_mostly_221(self):
+        result = generate_recommendations(
+            ModelTests.sample_draws(80),
+            self._marks(),
+            shape_key="221",
+            use_duplex_232=False,
+            constrain_sum=False,
+            front_odd=ODD_EVEN_ANY,
+            back_odd=ODD_EVEN_ANY,
+            include_reference=False,
+            ticket_count=5,
+        )
+        shapes = [ticket["shape"] for ticket in result["tickets"]]
+        self.assertGreaterEqual(len(result["tickets"]), 5)
+        self.assertGreaterEqual(shapes.count("221"), 3)
+        self.assertEqual(result["params"]["shape_key"], "221")
+        self.assertEqual(result["params"]["shape_plan"], [])
+        self.assertIsNone(result["params"]["shape_infer"])
+        self.assertFalse(result["params"]["use_duplex_232"])
+        self.assertEqual(result["duplex_232"], [])
 
 
 if __name__ == "__main__":
